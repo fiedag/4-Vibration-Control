@@ -39,8 +39,13 @@ def main() -> None:
         print(f"Mean nutation:    {results['mean_nutation_deg']:.4f} deg")
         print(f"Mean CM offset:   {results['mean_cm_offset']:.4f} m")
     else:
-        # Demo mode — reuse quick_sim logic
-        import scripts.quick_sim as qs
+        # Demo mode â€” reuse quick_sim logic
+        import sys
+        import os
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        outer_scripts = os.path.normpath(os.path.join(script_dir, '..', '..', 'scripts'))
+        sys.path.insert(0, outer_scripts)
+        import quick_sim as qs
         demo_map = {
             "torque-free": qs.demo_torque_free,
             "imbalance":   qs.demo_imbalance,
