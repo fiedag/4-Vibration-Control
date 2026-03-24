@@ -41,8 +41,8 @@ habitat_sim/
 │   └── motor.py               # Spin motor with torque profiles
 ├── sensors/
 │   ├── __init__.py
-│   ├── accelerometer.py       # 3-axis accelerometer model with noise
-│   └── mass_tracker.py        # Sector mass estimation with noise + update rate
+│   ├── strain_gauge.py        # Floor force sensor model — one per sector
+│   └── sensor_suite.py        # Combines all sensors → observation vector
 ├── disturbances/
 │   ├── __init__.py
 │   ├── mass_schedule.py       # Prescribed crew/cargo movement events
@@ -122,11 +122,7 @@ class MotorConfig:
 
 @dataclass
 class SensorConfig:
-    n_accelerometers: int = 6
-    accelerometer_positions: np.ndarray  # (N_s, 3) body-frame positions
-    accelerometer_noise_std: float       # m/s² per axis
-    mass_tracker_noise_std: float        # kg per sector
-    mass_tracker_update_rate: float      # Hz
+    strain_gauge_noise_std: float = 10.0  # N per gauge (white Gaussian)
 
 @dataclass
 class SimulationConfig:
@@ -237,10 +233,16 @@ class SimulationEngine:
     def __init__(self, config: ExperimentConfig):
         self.config = config
         self.geometry = create_geometry(config.habitat)
-        self.dynamics = create_dynamics(config.simulation.dynamics_level)
+        self.dynamics = RigidBodyDynamics(config.tanks)
         self.tank_system = TankSystem(config.tanks)
         self.motor = SpinMotor(config.motor)
-        self.sensors = SensorSuite(config.sensors, self.geometry)
+        self.sector_positions = self.geometry.compute_sector_positions(config.sectors)
+        self.sensors = SensorSuite(
+            config.sensors, self.sector_positions,
+            n_sectors=config.sectors.n_total,
+            n_tanks=config.tanks.n_tanks_total,
+            n_manifolds=config.tanks.n_stations,
+        )
         self.scenario = Scenario(config.disturbances)
         self.monitor = ConservationMonitor()
         self.state = SimState(config)
@@ -504,7 +506,7 @@ class HabitatEnv(gymnasium.Env):
         self.config = config
         self.engine = SimulationEngine(config)
 
-        n_obs = 3 * config.sensors.n_accelerometers + 75  # 93 for 6 accels
+        n_obs = config.sectors.n_total + config.tanks.n_tanks_total + config.tanks.n_stations  # 75 for default cylinder
         n_act = config.tanks.n_tanks_per_station * config.tanks.n_stations  # 36
 
         self.observation_space = gymnasium.spaces.Box(
@@ -618,7 +620,7 @@ The integrator and engine code are unchanged. Only the `compute_derivatives` imp
 
 ### 7.3 Observation Space Growth
 
-Level 2+ adds vibration content to accelerometer readings. The accelerometer model uses the dynamics model's output to compute a_meas including modal contributions. The observation vector shape grows only if we add modal state feedback to the agent (optional — the accelerometers already contain the modal information implicitly).
+Level 2+ adds vibration content to the strain gauge readings via the Euler acceleration term (`dω/dt × r`). Modal oscillations produce time-varying angular accelerations that modulate the force pattern around the ring, so the agent receives vibration information implicitly through the existing 36-gauge observation without requiring additional sensor channels.
 
 ---
 
@@ -709,8 +711,8 @@ The build sequence is designed so each step produces a testable, runnable artifa
 16. **Milestone: mass imbalance produces correct conical whirl, tanks can correct it**
 
 ### Phase 3: Sensors and Environment (can train RL agent)
-17. `sensors/accelerometer.py`
-18. `sensors/mass_tracker.py`
+17. `sensors/strain_gauge.py`
+18. `sensors/sensor_suite.py`
 19. `environment/habitat_env.py`
 20. Gymnasium env check passes
 21. **Milestone: random agent runs episodes, observations and actions are correct shapes**

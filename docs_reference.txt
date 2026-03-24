@@ -1,0 +1,1958 @@
+# Level 1: Rigid Body Dynamics for Rotating Space Habitat
+
+## 1. Coordinate Frames
+
+We define three coordinate frames:
+
+### 1.1 Inertial Frame (I)
+- Origin at the habitat's nominal centre of mass
+- Axes fixed in inertial space: **X_I**, **Y_I**, **Z_I**
+- Z_I aligned with the nominal spin axis at t = 0
+
+### 1.2 Body-Fixed Frame (B)
+- Origin at the geometric centre of the habitat
+- **z_B** along the structural symmetry axis (the intended spin axis)
+- **x_B**, **y_B** in the plane of the habitat cross-section
+- Rotates with the structure
+
+### 1.3 Relationship
+The orientation of B relative to I is described by a rotation matrix **R(t)** parameterised by quaternions **q(t) = [q₀, q₁, q₂, q₃]** to avoid gimbal lock. Euler angles (precession ψ, nutation θ, spin φ) are derived from the quaternion for visualization and analysis but are not used in the integration.
+
+The kinematic equation for the quaternion:
+
+```
+dq/dt = ½ Ω(ω) · q
+```
+
+where Ω(ω) is the 4×4 skew-symmetric matrix formed from the body-frame angular velocity **ω = [ω_x, ω_y, ω_z]ᵀ**:
+
+```
+        ┌  0   -ω_x  -ω_y  -ω_z ┐
+Ω(ω) = │ ω_x    0    ω_z  -ω_y  │
+        │ ω_y  -ω_z    0    ω_x  │
+        └ ω_z   ω_y  -ω_x    0   ┘
+```
+
+---
+
+## 2. Habitat Geometry & Structural Inertia
+
+The habitat structural mass distribution is computed analytically for each geometry class.
+
+### 2.1 Cylinder
+
+Parameters: radius R, length L, wall thickness t, wall material density ρ_w, end plate thickness t_e, end plate density ρ_e.
+
+**Shell mass:**
+```
+m_shell = ρ_w · 2πR · t · L
+```
+
+**End plate mass (each):**
+```
+m_end = ρ_e · π R² · t_e
+```
+
+**Structural inertia tensor** (body frame, about geometric centre):
+
+For a thin-walled cylinder:
+```
+I_xx = I_yy = m_shell · (R²/2 + L²/12) + 2 · m_end · (R²/4 + L²/4)
+I_zz = m_shell · R² + 2 · m_end · R²/2
+I_xy = I_xz = I_yz = 0   (by symmetry)
+```
+
+The second term in I_xx/I_yy for the end plates uses the parallel axis theorem to shift from the end plate centroid to the habitat centre.
+
+### 2.2 Ring (Open Cylinder — no end plates)
+
+Same as cylinder with m_end = 0. This is a short, open-ended cylinder.
+
+### 2.3 Toroid
+
+Parameters: major radius R_maj (centre of tube to axis), minor radius r (tube radius), wall thickness t, density ρ_w.
+
+**Shell mass:**
+```
+m_torus = ρ_w · 4π² R_maj · r · t
+```
+
+**Inertia tensor:**
+```
+I_xx = I_yy = m_torus · (R_maj² /2 + 5r²/8)
+I_zz = m_torus · (R_maj² + 3r²/4)
+```
+
+(Thin-walled approximation; exact expressions use inner/outer radii if t/r is not small.)
+
+---
+
+## 3. Sector Decomposition & Moving Masses
+
+### 3.1 Sector Definition
+
+The habitat interior is divided into **N_θ = 12** angular sectors and **N_z = 3** axial slices (for cylinders), giving **36 total sectors**. For toroids, N_z = 1 (single axial slice), giving 12 sectors. Each sector is identified by indices (i, j) where i ∈ {1..12} is the angular index and j ∈ {1..3} is the axial index.
+
+Sector angular span:
+```
+Δθ = 2π / 12 = 30°  (0.5236 rad)
+```
+
+Sector axial span (cylinder):
+```
+Δz = L / 3
+```
+
+Sector centroid in body frame:
+```
+r_ij = [ R · cos(θ_i),  R · sin(θ_i),  z_j ]ᵀ
+```
+
+where θ_i = (i - ½)Δθ and z_j = -L/2 + (j - ½)Δz.
+
+### 3.2 Mass in Each Sector
+
+At any time t, each sector (i,j) contains a lumped mass m_ij(t) representing crew and cargo. These masses move according to prescribed schedules or stochastic models (see Section 8).
+
+### 3.3 Total Mass and Centre of Mass
+
+```
+M_total = m_struct + Σ_ij m_ij(t) + Σ_ij m_tank_ij(t) + Σ_j m_manifold_j(t)
+
+r_cm(t) = (1/M_total) · [ m_struct · r_struct_cm
+                          + Σ_ij m_ij(t) · r_ij
+                          + Σ_ij m_tank_ij(t) · r_tank(i,j)
+                          + Σ_j m_manifold_j(t) · r_manifold_j ]
+```
+
+For symmetric structures, r_struct_cm = **0**. The manifold positions r_manifold_j are at [0, 0, z_j]ᵀ (on-axis at each station), so manifold water only affects the z-component of CM — circumferential correction comes entirely from the tanks.
+
+### 3.4 Total Inertia Tensor
+
+The total inertia tensor about the geometric centre is:
+
+```
+I_total(t) = I_struct
+            + Σ_ij m_ij(t) · [ |r_ij|² 𝟏₃ - r_ij r_ijᵀ ]              (crew/cargo)
+            + Σ_ij m_tank_ij(t) · [ |r_tank(i,j)|² 𝟏₃ - r_tank(i,j) r_tank(i,j)ᵀ ]  (tanks)
+            + Σ_j m_manifold_j(t) · [ |r_manifold_j|² 𝟏₃ - r_manifold_j r_manifold_jᵀ ]  (manifolds)
+```
+
+where 𝟏₃ is the 3×3 identity. This is the standard point-mass contribution via the parallel axis theorem.
+
+**Important:** Because the dynamics are formulated about the geometric centre (not the CM), we need the inertia tensor about this fixed body-frame point. This avoids having to track a moving reference point, at the cost of introducing CM-offset coupling terms in the equations of motion.
+
+### 3.5 Inertia Tensor Rate of Change
+
+When masses move between sectors, the inertia tensor changes:
+
+```
+dI/dt = Σ_ij dm_ij/dt · [ |r_ij|² 𝟏₃ - r_ij r_ijᵀ ]
+       + Σ_ij m_ij(t) · [ 2(r_ij · dr_ij/dt) 𝟏₃ - (dr_ij/dt · r_ijᵀ + r_ij · dr_ij/dtᵀ) ]
+```
+
+For the discrete-sector model where masses jump between sectors at discrete times, we can treat dI/dt as piecewise constant between transition events. Alternatively, masses can be interpolated smoothly between sectors to avoid discontinuities in the integrator.
+
+---
+
+## 4. Equations of Motion — Euler's Equations with Variable Inertia
+
+### 4.1 Angular Momentum
+
+The angular momentum about the geometric centre in the body frame:
+
+```
+H = I(t) · ω + M_total · r_cm × (ω × r_cm)    ... (cross-coupling from CM offset)
+```
+
+However, if we formulate about the **instantaneous CM** (which is standard), the angular momentum is simply:
+
+```
+H_cm = I_cm(t) · ω
+```
+
+where I_cm is the inertia tensor about the CM, obtained via the parallel axis theorem from the geometric-centre tensor:
+
+```
+I_cm = I_total - M_total · [ |r_cm|² 𝟏₃ - r_cm r_cmᵀ ]
+```
+
+### 4.2 Euler's Equations
+
+In the body frame, conservation of angular momentum gives:
+
+```
+dH/dt |_body + ω × H = τ_ext
+```
+
+Expanding:
+
+```
+I(t) · dω/dt + dI/dt · ω + ω × (I(t) · ω) = τ_ext
+```
+
+Rearranging for the angular acceleration:
+
+```
+dω/dt = I(t)⁻¹ · [ τ_ext - dI/dt · ω - ω × (I(t) · ω) ]
+```
+
+### 4.3 External Torques
+
+**τ_ext** includes:
+- **Spin motor torque** τ_motor(t): Applied about z_B during spin-up/spin-down. Profile is user-defined (constant, ramp, trapezoidal, S-curve).
+- **Counterweight actuator torques** (Level 1 placeholder): From control system moving counterweights. Modelled as reaction torques from redistributing mass.
+- **No gravity gradient** (microgravity, free-flying habitat).
+- **No atmospheric drag** (deep space or high orbit).
+
+### 4.4 Translational Dynamics
+
+The CM offset means the geometric centre orbits the true CM. For a free-flying body:
+
+```
+d²r_cm_inertial/dt² = F_ext / M_total
+```
+
+With no external forces, the CM is fixed in inertial space. The geometric centre traces out a path around it. This matters for crew comfort (generates a parasitic acceleration at the habitat wall) and for docking/proximity operations.
+
+The parasitic acceleration at a point **r** in the body frame:
+
+```
+a_parasitic(r) = ω × (ω × (r - r_cm)) + dω/dt × (r - r_cm)
+```
+
+This is what the accelerometers measure (minus the centripetal acceleration from nominal spin, which is the desired artificial gravity).
+
+---
+
+## 5. State Vector and Integration
+
+### 5.1 State Vector
+
+The full state for Level 1:
+
+```
+x = [ q₀, q₁, q₂, q₃,  ω_x, ω_y, ω_z,                    (7 rigid body states)
+      m_tank_11, ..., m_tank_12,3,                            (36 tank fill levels)
+      m_manifold_1, m_manifold_2, m_manifold_3 ]              (3 manifold levels)
+```
+
+**Total state dimension: 46**
+
+The quaternion must be renormalised at each step. Tank and manifold masses evolve according to the valve commands and axial transfer dynamics (Section 9.5). Water mass conservation provides a verification constraint at every step.
+
+### 5.2 Equations Summary
+
+```
+Rigid body:
+  dq/dt  = ½ Ω(ω) · q
+  dω/dt  = I(t)⁻¹ · [ τ_ext - dI/dt · ω - ω × (I(t) · ω) ]
+
+Tank dynamics (per tank):
+  dm_tank_ij/dt = v_ij · q_circ_max                    (clipped at tank limits)
+
+Manifold dynamics (per station):
+  dm_manifold_j/dt = -Σ_i (v_ij · q_circ_max) + q_axial_net_j
+
+Axial transfer (automatic equalisation):
+  q_axial_net_j = f(m_manifold_1, m_manifold_2, m_manifold_3, q_axial_max)
+```
+
+### 5.3 Integrator Choice
+
+Recommended: **RK4** (classical 4th-order Runge-Kutta) for initial development, with quaternion renormalisation after each full step. For production, a symplectic integrator or implicit method may be needed if energy drift is unacceptable over long simulations.
+
+Time step sizing: The fastest dynamics are at the spin frequency Ω_spin. A rule of thumb is Δt ≤ T_spin / 50 for RK4. At 2 rpm (T_spin = 30 s), this gives Δt ≤ 0.6 s. For accurate nutation capture, use Δt ≤ T_nutation / 20, where T_nutation is typically shorter than T_spin.
+
+### 5.4 Quaternion Normalisation
+
+After each integration step:
+
+```
+q ← q / |q|
+```
+
+This corrects numerical drift that would otherwise cause the rotation matrix to become non-orthogonal.
+
+---
+
+## 6. Precession and Nutation Analysis
+
+### 6.1 Steady-State Spin with Imbalance
+
+For an axisymmetric body spinning at rate Ω about z_B, small perturbations produce:
+
+**Nutation frequency:**
+```
+ω_nut = Ω · (I_zz - I_xx) / I_xx     (for I_xx = I_yy, axisymmetric case)
+```
+
+This is the free nutation (torque-free precession) frequency. For a thin-walled cylinder where I_zz ≈ 2·I_xx, ω_nut ≈ Ω. For a toroid, the ratio depends on geometry.
+
+**Precession rate** (under a constant transverse torque τ_perp):
+```
+ω_prec = τ_perp / (I_zz · Ω)
+```
+
+### 6.2 Imbalance-Driven Behaviour
+
+A static mass imbalance (CM offset) at spin rate Ω creates a rotating unbalanced centrifugal force. In the body frame this appears as a constant radial force. The resulting motion is a **conical whirl** — the spin axis traces a cone in inertial space.
+
+A dynamic mass imbalance (product of inertia I_xz or I_yz ≠ 0) causes the principal axis to be misaligned from the geometric axis, producing steady-state nutation.
+
+The simulation naturally captures both effects through the full Euler equations without linearisation.
+
+### 6.3 What to Monitor
+
+- **Nutation angle** θ_nut = arccos(z_B · Z_I) — angle between body spin axis and inertial spin axis
+- **Angular momentum vector** H in inertial frame (should be conserved when τ_ext = 0)
+- **Kinetic energy** T = ½ ωᵀ I ω (should be conserved when τ_ext = 0 and I is constant)
+- **CM offset magnitude** |r_cm| — primary disturbance metric
+
+---
+
+## 7. Spin-Up and Spin-Down Modelling
+
+### 7.1 Motor Torque Profiles
+
+The spin motor applies torque about z_B. Available profiles:
+
+| Profile | Description | Parameters |
+|---------|-------------|------------|
+| Constant | τ(t) = τ₀ | τ₀ |
+| Linear ramp | τ ramps from 0 to τ_max | τ_max, t_ramp |
+| Trapezoidal | Ramp up, hold, ramp down | τ_max, t_ramp, t_hold |
+| S-curve | Smooth jerk-limited profile | τ_max, t_ramp |
+| Custom | User-supplied τ(t) lookup table | Table data |
+
+### 7.2 Spin-Up Dynamics
+
+During spin-up from rest:
+- ω_z increases from 0 to target Ω
+- With mass imbalance present, ω_x and ω_y will be excited as the cross-coupling terms ω × (Iω) become significant
+- Passing through resonance conditions where ω_z equals natural frequencies (relevant for Level 2+) requires careful profiling
+
+The time to reach target spin:
+```
+t_spinup ≈ I_zz · Ω / τ_avg
+```
+
+### 7.3 Spin-Down
+
+Reverse of spin-up. The motor applies braking torque. Same profiles available. During spin-down, nutation effects can grow as ω_z decreases (nutation angle scales inversely with spin rate for a given angular momentum perturbation).
+
+### 7.4 Acceleration Profiles at the Rim
+
+During spin-up, the artificial gravity at radius R is:
+```
+g_art(t) = ω_z(t)² · R
+```
+
+The tangential acceleration from spin-up torque:
+```
+a_tang = dω_z/dt · R = τ_motor / I_zz · R
+```
+
+Both must be within crew comfort limits, typically g_art < 1g target and a_tang < 0.01g.
+
+---
+
+## 8. Mass Movement Models
+
+### 8.1 Prescribed Schedules
+
+Crew and cargo movements can be specified as time-scheduled events:
+
+```python
+# Example: crew member moves from sector (3,1) to sector (7,1) at t=100s
+event = MassTransfer(time=100.0, mass=80.0, from_sector=(3,1), to_sector=(7,1), duration=30.0)
+```
+
+The `duration` parameter controls how quickly the mass transitions, allowing smooth interpolation of the inertia tensor.
+
+### 8.2 Stochastic Models
+
+For Monte Carlo analysis, crew movement can follow probabilistic models:
+- **Random walk**: Each crew member moves to an adjacent sector with some probability per time step
+- **Activity-based**: Crew members transition between zones (sleep, work, exercise, galley) on schedules with random perturbations
+- **Correlated movement**: Shift changes where multiple crew move simultaneously (worst-case scenario for imbalance)
+
+### 8.3 Cargo Operations
+
+Large mass movements (resupply, waste management, manufacturing) can be scheduled deterministically. These are typically the largest single-event disturbances.
+
+---
+
+## 9. Counterweight Model (36 Rim Water Tanks — Hybrid Manifold)
+
+### 9.1 Tank Layout
+
+The control system uses **36 rim water tanks**: 12 tanks at each of the 3 axial stations, co-located with the 12 angular sectors. Each tank sits at the rim radius R at angular position θ_i and axial position z_j.
+
+**Tank position in body frame:**
+```
+r_tank(i,j) = [ R · cos(θ_i),  R · sin(θ_i),  z_j ]ᵀ
+```
+
+where i ∈ {1..12} is the angular index and j ∈ {1..3} is the axial station index, using the same angular and axial positions as the sector decomposition (Section 3.1).
+
+**Effect on inertia tensor:** Each tank contributes as a point mass at its body-frame position. The total counterweight contribution to the inertia tensor:
+
+```
+I_tanks(t) = Σ_i Σ_j m_tank_ij(t) · [ |r_tank(i,j)|² 𝟏₃ - r_tank(i,j) r_tank(i,j)ᵀ ]
+```
+
+This is added to I_struct and the crew/cargo sector contributions to form I_total.
+
+### 9.2 Hybrid Manifold Topology
+
+The plumbing uses a **hybrid manifold** architecture with two timescales of actuation:
+
+**Fast channel — circumferential redistribution:**
+Each axial station has its own local manifold (reservoir). The 12 tanks at that station are connected to the local manifold via individual valves/pumps. Water can be rapidly redistributed among the 12 tanks within a single station.
+
+```
+Station j manifold mass: m_manifold_j(t)
+Conservation per station (when axial transfers inactive):
+  m_manifold_j + Σ_i m_tank_ij = m_water_station_j = const
+```
+
+**Slow channel — axial redistribution:**
+The 3 local manifolds are connected by axial transfer lines. Water can be pumped between stations, but at a lower flow rate (longer pipe runs, smaller cross-section).
+
+```
+Total water conservation:
+  Σ_j [ m_manifold_j + Σ_i m_tank_ij ] = m_water_total = const
+```
+
+**Flow rate limits:**
+
+| Channel | Rate limit | Typical value |
+|---------|-----------|---------------|
+| Tank ↔ local manifold (circumferential) | q_circ_max (kg/s per valve) | Fast — primary disturbance rejection |
+| Manifold ↔ manifold (axial) | q_axial_max (kg/s per line) | Slow — steady-state trim, q_axial_max << q_circ_max |
+
+The ratio q_circ_max / q_axial_max is a design parameter. A ratio of 5–10× is physically reasonable and creates a natural timescale separation.
+
+### 9.3 Correction Authority
+
+The 36-tank layout provides full 5-DOF correction:
+
+| Correction | Method | Tanks involved |
+|------------|--------|----------------|
+| CM offset x_B | Differential angular redistribution at all stations | All 36 |
+| CM offset y_B | Differential angular redistribution at all stations | All 36 |
+| CM offset z_B | Axial transfer: shift total water mass between stations | Axial lines |
+| Product I_xz | Opposing angular patterns at different stations (e.g. +x at fwd, -x at aft) | Cross-station coordination |
+| Product I_yz | Opposing angular patterns at different stations (e.g. +y at fwd, -y at aft) | Cross-station coordination |
+
+Static imbalance (CM offset) correction uses the fast circumferential channel. Dynamic imbalance (product of inertia) correction requires coordinated cross-station action using both channels.
+
+### 9.4 Action Space for Control
+
+The action space is **36-dimensional**, one valve command per tank:
+
+```
+a = [ v_11, v_12, ..., v_1,12,     (station 1: 12 valve commands)
+      v_21, v_22, ..., v_2,12,     (station 2: 12 valve commands)
+      v_31, v_32, ..., v_3,12 ]    (station 3: 12 valve commands)
+```
+
+Each v_ij ∈ [-1, +1] represents the normalised valve command for tank (i,j):
+- v_ij > 0: fill tank from local manifold (rate = v_ij · q_circ_max)
+- v_ij < 0: drain tank to local manifold (rate = |v_ij| · q_circ_max)
+- v_ij = 0: valve closed
+
+Additionally, 2 axial transfer commands (between the 3 manifolds):
+
+```
+a_axial = [ q_12, q_23 ]
+```
+
+where q_12 is the flow rate from manifold 1 to manifold 2, and q_23 from manifold 2 to manifold 3. These can be positive or negative.
+
+**Total action dimension: 38** (36 valve commands + 2 axial transfers).
+
+However, to keep the action space at 36 dimensions, the axial transfers can be derived implicitly: if the net flow into/out of a station's manifold from its 12 valves would cause the manifold to empty or overfill, the axial transfer system automatically equalises pressure between manifolds. This makes the axial channel reactive rather than directly controlled, reducing the RL agent's burden while preserving the physical capability.
+
+**Recommended approach for RL:** Use the **36-dimensional** action space (valve commands only). Implement the axial transfer as an automatic background process that equalises manifold levels at rate q_axial_max. The agent learns circumferential control; axial rebalancing happens passively. Once the agent is trained, the axial channel can be promoted to direct control if needed.
+
+### 9.5 Tank State Dynamics
+
+The fill state of each tank evolves as:
+
+```
+dm_tank_ij/dt = v_ij · q_circ_max                     (valve flow)
+
+dm_manifold_j/dt = -Σ_i (v_ij · q_circ_max)           (manifold: net of all valve flows at station j)
+                   + q_axial_in_j - q_axial_out_j      (axial transfers)
+```
+
+**Constraints:**
+```
+0 ≤ m_tank_ij ≤ m_tank_max        (tank capacity)
+0 ≤ m_manifold_j                    (manifold can't go negative)
+```
+
+When a tank hits its upper or lower limit, the valve command is clipped. When a manifold approaches empty, all drain commands at that station are throttled proportionally.
+
+### 9.6 Reward Shaping for Tank Control
+
+With 36 actuators and a large null space, auxiliary reward terms prevent degenerate policies:
+
+```
+r_total = r_vibration + λ_1 · r_energy + λ_2 · r_smooth + λ_3 · r_reserve
+```
+
+| Term | Purpose | Formula |
+|------|---------|---------|
+| r_vibration | Primary: minimise wobble | -‖ω_x, ω_y‖ or -‖a_parasitic‖ |
+| r_energy | Penalise total pump activity | -Σ ‖v_ij‖ |
+| r_smooth | Penalise jerky valve commands | -Σ ‖v_ij(t) - v_ij(t-1)‖ |
+| r_reserve | Prefer balanced fill levels | -Σ (m_tank_ij - m_uniform)² |
+
+The reserve term softly biases the agent toward keeping water distributed evenly, maintaining capacity for future corrections without constraining which correction strategy it finds.
+
+---
+
+## 10. Sensor Model (Observations)
+
+### 10.1 Strain Gauge Floor Force Sensors
+
+Each sector floor (the outer rim wall) has a strain gauge measuring the compressive normal force from the mass above it. In the rotating body frame, the inertial acceleration at sector centroid **r_i** is:
+
+```
+a_i = ω × (ω × r_i) + dω/dt × r_i
+```
+
+The centripetal term `ω × (ω × r_i)` points inward and is dominant during steady spin (artificial gravity). The Euler term `dω/dt × r_i` captures angular acceleration from nutation and wobble.
+
+The outward radial unit vector for sector i (projected onto the xy-plane):
+
+```
+r̂_i = (r_i projected onto xy) / |r_i projected onto xy|
+```
+
+The gauge measures the component of inertial force normal to the floor:
+
+```
+F_i = m_i · (-r̂_i · a_i) + noise
+```
+
+The sign convention gives **F_i > 0** for compressive load (mass pressing outward against the floor). During steady spin at rate ω_z: F_i ≈ m_i · ω_z² · R. Wobble (non-zero ω_x, ω_y) creates a sinusoidal variation in F_i around the ring that reveals the current nutation state.
+
+**Sensor noise model:** White Gaussian noise with standard deviation σ_gauge per gauge (Newtons). Default: 10 N.
+
+### 10.2 Observation Vector
+
+The full observation for the RL agent:
+
+```
+o = [ F_1, ..., F_36,                               (36 strain gauge readings, N)
+      m_tank_11, ..., m_tank_12,3,                   (36 current tank fill levels, kg)
+      m_manifold_1, m_manifold_2, m_manifold_3 ]     (3 manifold levels, kg)
+```
+
+Total observation dimension: 36 + 36 + 3 = **75**.
+
+The observation naturally decomposes into:
+- **Disturbance information**: strain gauge forces (encode both sector occupancy and nutation state)
+- **Actuator state**: tank fill levels + manifold levels (available correction resources)
+
+---
+
+## 11. Conservation Laws (Verification)
+
+### 11.1 Angular Momentum Conservation
+
+When τ_ext = 0 (no motor torque, no external forces):
+
+```
+H_inertial = R(q) · I(t) · ω = constant
+```
+
+This must hold even as I(t) changes due to mass movement. The simulation must verify:
+
+```
+|H(t) - H(0)| / |H(0)| < ε_tol
+```
+
+at every time step. Typical tolerance: ε_tol = 1e-8 for RK4 with appropriate step size.
+
+### 11.2 Energy
+
+Total kinetic energy:
+
+```
+T = ½ ωᵀ I(t) ω
+```
+
+When masses move and I changes with no external torque, kinetic energy is **not** conserved — the moving masses do work against the centrifugal field. The change in kinetic energy should equal the work done by internal forces moving the masses. This is a useful consistency check.
+
+### 11.3 Water Mass Conservation
+
+```
+Σ_j [ m_manifold_j(t) + Σ_i m_tank_ij(t) ] = m_water_total = const
+```
+
+Must hold exactly (to machine precision) at every time step. Any drift indicates a bug in the tank/manifold integration.
+
+### 11.4 Quaternion Norm
+
+```
+|q|² = q₀² + q₁² + q₂² + q₃² = 1
+```
+
+Must hold to machine precision after normalisation.
+
+---
+
+## 12. Computational Notes
+
+### 12.1 Inertia Tensor Inverse
+
+I(t) is 3×3 symmetric positive definite. Direct inversion (Cramer's rule or Cholesky) is fine — this is not a bottleneck. Recompute at each RK4 sub-step since I depends on the current mass distribution.
+
+### 12.2 Mass Movement Interpolation
+
+To avoid discontinuous jumps in I(t) when a mass transfers between sectors, linearly interpolate the mass between the source and destination sector positions over the transfer duration. This gives a smooth dI/dt and avoids integrator difficulties.
+
+### 12.3 Performance Considerations
+
+For a single forward simulation, Level 1 is computationally cheap — the bottleneck is the 3×3 matrix operations at each step, which are trivial. The cost scales with the number of RL training episodes, not the physics complexity. At 100 Hz simulation rate for a 1-hour scenario, that's 360,000 steps per episode — straightforward in Python, and the main candidate for C++ acceleration later is the batch simulation of many episodes in parallel.
+
+### 12.4 Units Convention
+
+| Quantity | Unit |
+|----------|------|
+| Length | metres (m) |
+| Mass | kilograms (kg) |
+| Time | seconds (s) |
+| Angle | radians (rad) |
+| Angular velocity | rad/s |
+| Torque | N·m |
+| Acceleration | m/s² |
+| Inertia | kg·m² |
+
+Spin rates may be displayed in rpm for user convenience but are always stored and computed in rad/s.
+# Code Architecture: Rotating Space Habitat Simulation
+
+## 1. Design Principles
+
+**Separation of concerns.** The physics engine knows nothing about RL. The RL environment wraps the physics engine and translates between physics state and agent observations/actions. The database layer is orthogonal to both.
+
+**Configuration-driven.** Every physical parameter (geometry, masses, sensor placement, tank layout, motor profiles) is specified in a configuration object, not hardcoded. This lets us sweep parameters without touching code.
+
+**Level-agnostic core.** The integrator, coordinate transforms, and state management are shared across Levels 1–3. The dynamics model is swappable — Level 1 plugs in rigid body equations, Level 2 adds modal states, Level 3 extends to 20 modes. The interface between the integrator and the dynamics model is fixed.
+
+**NumPy-first, C++-ready.** All physics computations use NumPy arrays with shapes that map directly to C arrays. No Python objects in the inner loop. When we migrate to C++, the physics core becomes a shared library called via ctypes or pybind11, and the Python wrapper stays identical.
+
+---
+
+## 2. Package Structure
+
+```
+habitat_sim/
+├── __init__.py
+├── config.py                  # Configuration dataclasses
+├── core/
+│   ├── __init__.py
+│   ├── quaternion.py          # Quaternion math (multiply, normalize, to_rotation_matrix, to_euler)
+│   ├── inertia.py             # Inertia tensor computation from geometry + point masses
+│   └── integrator.py          # RK4 integrator with quaternion normalisation
+├── geometry/
+│   ├── __init__.py
+│   ├── base.py                # Abstract HabitatGeometry class
+│   ├── cylinder.py            # Cylinder (with end plates)
+│   ├── ring.py                # Open cylinder
+│   └── toroid.py              # Toroid
+├── dynamics/
+│   ├── __init__.py
+│   ├── base.py                # Abstract DynamicsModel interface
+│   ├── rigid_body.py          # Level 1: Euler equations with variable inertia
+│   ├── modal_2.py             # Level 2: rigid body + 2 flex modes (future)
+│   └── modal_20.py            # Level 3: rigid body + 20 flex modes (future)
+├── actuators/
+│   ├── __init__.py
+│   ├── tank_system.py         # 36 rim tanks + 3 manifolds + hybrid plumbing
+│   └── motor.py               # Spin motor with torque profiles
+├── sensors/
+│   ├── __init__.py
+│   ├── strain_gauge.py        # Floor force sensor model — one per sector
+│   └── sensor_suite.py        # Combines all sensors → observation vector
+├── disturbances/
+│   ├── __init__.py
+│   ├── mass_schedule.py       # Prescribed crew/cargo movement events
+│   ├── stochastic.py          # Random walk, activity-based, correlated movement
+│   └── scenario.py            # Scenario: combines multiple disturbance sources
+├── simulation/
+│   ├── __init__.py
+│   ├── state.py               # SimState: full state vector + unpacking utilities
+│   ├── engine.py              # SimulationEngine: ties everything together, steps forward
+│   └── monitors.py            # Conservation law checks, diagnostics
+├── environment/
+│   ├── __init__.py
+│   └── habitat_env.py         # Gymnasium environment wrapping SimulationEngine
+├── control/
+│   ├── __init__.py
+│   ├── sac_agent.py           # SAC + MLP policy (wraps stable-baselines3 or clean impl)
+│   └── training.py            # Training loop, hyperparameters, curriculum
+├── database/
+│   ├── __init__.py
+│   ├── schema.py              # SQLAlchemy models (experiments, episodes, snapshots)
+│   ├── recorder.py            # Records simulation data to DB during/after runs
+│   └── queries.py             # Analysis queries (compare experiments, extract time series)
+├── visualization/
+│   ├── __init__.py
+│   ├── plots.py               # Matplotlib: time series, phase plots, momentum vectors
+│   ├── scene_3d.py            # 3D habitat rendering with momentum/spin axis vectors
+│   └── dashboard.py           # Live or post-hoc dashboard (optional, later)
+└── scripts/
+    ├── run_simulation.py      # CLI: run a single simulation from config file
+    ├── train_agent.py         # CLI: train SAC agent
+    ├── evaluate_agent.py      # CLI: evaluate trained agent on scenarios
+    └── analyse_experiment.py  # CLI: pull data from DB and generate reports
+```
+
+---
+
+## 3. Core Abstractions
+
+### 3.1 Configuration (`config.py`)
+
+All parameters in one place, serialisable to JSON/YAML for experiment reproducibility.
+
+```python
+@dataclass
+class HabitatConfig:
+    shape: str                     # "cylinder", "ring", "toroid"
+    radius: float                  # m (R for cylinder/ring, R_maj for toroid)
+    length: float                  # m (L for cylinder/ring, unused for toroid)
+    minor_radius: float            # m (r for toroid, unused otherwise)
+    wall_thickness: float          # m
+    wall_density: float            # kg/m³
+    end_plate_thickness: float     # m (cylinder only)
+    end_plate_density: float       # kg/m³ (cylinder only)
+
+@dataclass
+class SectorConfig:
+    n_angular: int = 12
+    n_axial: int = 3               # 1 for toroid
+
+@dataclass
+class TankConfig:
+    n_tanks_per_station: int = 12
+    n_stations: int = 3
+    tank_capacity: float           # kg (m_tank_max per tank)
+    total_water_mass: float        # kg (m_water_total)
+    initial_distribution: str      # "uniform", "custom"
+    q_circ_max: float              # kg/s (circumferential pump rate limit)
+    q_axial_max: float             # kg/s (axial transfer rate limit)
+
+@dataclass
+class MotorConfig:
+    profile: str                   # "constant", "ramp", "trapezoidal", "s_curve", "custom"
+    max_torque: float              # N·m
+    ramp_time: float               # s
+    hold_time: float               # s (trapezoidal only)
+    target_spin_rate: float        # rad/s
+
+@dataclass
+class SensorConfig:
+    strain_gauge_noise_std: float = 10.0  # N per gauge (white Gaussian)
+
+@dataclass
+class SimulationConfig:
+    dt: float = 0.01               # s (integration time step)
+    duration: float = 3600.0       # s (total simulation time)
+    control_dt: float = 0.1        # s (RL agent decision interval)
+    dynamics_level: int = 1        # 1, 2, or 3
+
+@dataclass
+class ExperimentConfig:
+    habitat: HabitatConfig
+    sectors: SectorConfig
+    tanks: TankConfig
+    motor: MotorConfig
+    sensors: SensorConfig
+    simulation: SimulationConfig
+    disturbances: list              # list of disturbance configs
+    seed: int = 42
+```
+
+### 3.2 Simulation State (`simulation/state.py`)
+
+A flat NumPy array with named slices. No Python objects in the hot path.
+
+```python
+class SimState:
+    """Manages the full state vector as a flat numpy array with named views."""
+
+    # Index map (Level 1, 46 states):
+    #   [0:4]    quaternion (q0, q1, q2, q3)
+    #   [4:7]    angular velocity (omega_x, omega_y, omega_z)
+    #   [7:43]   tank masses (36 tanks, row-major: station 1 angular 1..12, station 2, station 3)
+    #   [43:46]  manifold masses (3 manifolds)
+
+    def __init__(self, config: ExperimentConfig):
+        self.n_rigid = 7
+        self.n_tanks = config.tanks.n_tanks_per_station * config.tanks.n_stations  # 36
+        self.n_manifolds = config.tanks.n_stations  # 3
+        self.n_total = self.n_rigid + self.n_tanks + self.n_manifolds  # 46
+
+        self.x = np.zeros(self.n_total)
+        self.x[0] = 1.0  # quaternion scalar = 1 (identity rotation)
+
+    # --- Named views (zero-copy slices) ---
+    @property
+    def quaternion(self) -> np.ndarray:      # shape (4,)
+        return self.x[0:4]
+
+    @property
+    def omega(self) -> np.ndarray:           # shape (3,)
+        return self.x[4:7]
+
+    @property
+    def tank_masses(self) -> np.ndarray:     # shape (36,) or reshaped to (3, 12)
+        return self.x[7:43]
+
+    @property
+    def tank_masses_2d(self) -> np.ndarray:  # shape (3, 12) — [station, angular]
+        return self.x[7:43].reshape(3, 12)
+
+    @property
+    def manifold_masses(self) -> np.ndarray: # shape (3,)
+        return self.x[43:46]
+```
+
+### 3.3 Dynamics Model Interface (`dynamics/base.py`)
+
+The integrator calls this interface. Level 1, 2, 3 each implement it.
+
+```python
+class DynamicsModel(ABC):
+    """Interface for computing state derivatives."""
+
+    @abstractmethod
+    def compute_derivatives(
+        self,
+        t: float,
+        state: np.ndarray,
+        sector_masses: np.ndarray,       # (36,) current crew/cargo masses
+        tank_valve_commands: np.ndarray,  # (36,) normalised valve commands [-1, +1]
+        motor_torque: float,             # N·m about z_B
+        config: ExperimentConfig
+    ) -> np.ndarray:
+        """Returns dx/dt as a flat array matching state dimensions."""
+        ...
+
+    @abstractmethod
+    def state_dimension(self) -> int:
+        """Total number of state variables."""
+        ...
+```
+
+Level 1 implementation computes:
+1. Inertia tensor from geometry + sector masses + tank masses + manifold masses
+2. dI/dt from mass movement rates
+3. Euler equation: dω/dt = I⁻¹ [τ_ext − dI/dt·ω − ω×(Iω)]
+4. Quaternion kinematics: dq/dt = ½ Ω(ω)·q
+5. Tank dynamics: dm_tank/dt from valve commands
+6. Manifold dynamics: dm_manifold/dt from net valve flows + axial equalisation
+
+### 3.4 Simulation Engine (`simulation/engine.py`)
+
+Orchestrates one time step: queries disturbances, applies control, steps physics, checks constraints.
+
+```python
+class SimulationEngine:
+
+    def __init__(self, config: ExperimentConfig):
+        self.config = config
+        self.geometry = create_geometry(config.habitat)
+        self.dynamics = RigidBodyDynamics(config.tanks)
+        self.tank_system = TankSystem(config.tanks)
+        self.motor = SpinMotor(config.motor)
+        self.sector_positions = self.geometry.compute_sector_positions(config.sectors)
+        self.sensors = SensorSuite(
+            config.sensors, self.sector_positions,
+            n_sectors=config.sectors.n_total,
+            n_tanks=config.tanks.n_tanks_total,
+            n_manifolds=config.tanks.n_stations,
+        )
+        self.scenario = Scenario(config.disturbances)
+        self.monitor = ConservationMonitor()
+        self.state = SimState(config)
+        self.t = 0.0
+
+        # Precompute static geometry data
+        self.sector_positions = self.geometry.compute_sector_positions(config.sectors)
+        self.tank_positions = self.geometry.compute_tank_positions(config.tanks)
+        self.structural_inertia = self.geometry.compute_structural_inertia()
+
+    def step(self, action: np.ndarray) -> tuple[np.ndarray, float, bool, dict]:
+        """
+        Advance simulation by one control interval (control_dt).
+        Internally sub-steps at physics dt.
+
+        Args:
+            action: (36,) normalised valve commands from RL agent
+
+        Returns:
+            observation, reward, terminated, info
+        """
+        n_substeps = int(self.config.simulation.control_dt / self.config.simulation.dt)
+
+        for _ in range(n_substeps):
+            # Get current disturbance state (crew/cargo masses)
+            sector_masses = self.scenario.get_sector_masses(self.t)
+
+            # Get motor torque
+            motor_torque = self.motor.get_torque(self.t)
+
+            # RK4 step
+            self.state.x = rk4_step(
+                self.dynamics.compute_derivatives,
+                self.t, self.state.x,
+                sector_masses, action, motor_torque,
+                self.config, self.config.simulation.dt
+            )
+
+            # Post-step: normalise quaternion, clip tanks, update manifolds
+            self.state.quaternion[:] /= np.linalg.norm(self.state.quaternion)
+            self.tank_system.enforce_constraints(self.state)
+
+            # Conservation checks
+            self.monitor.check(self.t, self.state, self.config)
+
+            self.t += self.config.simulation.dt
+
+        # Build observation and reward
+        obs = self.sensors.observe(self.state, sector_masses)
+        reward = self.compute_reward(self.state, action)
+        terminated = self.t >= self.config.simulation.duration
+
+        return obs, reward, terminated, self.monitor.get_info()
+```
+
+---
+
+## 4. Data Flow
+
+```
+                    ┌─────────────────────┐
+                    │  ExperimentConfig    │
+                    │  (YAML/JSON)         │
+                    └──────────┬──────────┘
+                               │
+              ┌────────────────┼────────────────┐
+              ▼                ▼                 ▼
+     ┌──────────────┐  ┌────────────┐  ┌──────────────┐
+     │  Geometry     │  │  Scenario   │  │  TankSystem   │
+     │  (structural  │  │  (crew/cargo│  │  (36 tanks +  │
+     │   inertia)    │  │   masses)   │  │   3 manifolds)│
+     └──────┬───────┘  └─────┬──────┘  └──────┬───────┘
+            │                │                 │
+            └───────────┬────┴────┬────────────┘
+                        ▼         ▼
+                 ┌──────────────────────┐
+                 │   DynamicsModel       │
+                 │   (Level 1: rigid     │
+                 │    body equations)    │
+                 └──────────┬───────────┘
+                            │  dx/dt
+                            ▼
+                 ┌──────────────────────┐
+                 │   RK4 Integrator      │
+                 │   (sub-steps at dt)   │
+                 └──────────┬───────────┘
+                            │  x(t+Δt)
+                            ▼
+           ┌────────────────┼────────────────┐
+           ▼                ▼                 ▼
+   ┌──────────────┐  ┌────────────┐  ┌──────────────┐
+   │  Sensors      │  │  Monitor    │  │  Recorder    │
+   │  (obs vector) │  │  (H, E, q) │  │  (→ database)│
+   └──────┬───────┘  └────────────┘  └──────────────┘
+          │ observation
+          ▼
+   ┌──────────────┐
+   │  Gymnasium    │
+   │  Environment  │──── obs, reward, done ───▶  SAC Agent
+   │              │◀─── action (36 valves) ───  (MLP policy)
+   └──────────────┘
+```
+
+---
+
+## 5. Key Implementation Details
+
+### 5.1 Inertia Tensor Computation (`core/inertia.py`)
+
+This is called at every RK4 sub-step. Must be fast.
+
+```python
+def compute_inertia_tensor(
+    structural_inertia: np.ndarray,      # (3,3) precomputed, constant
+    sector_positions: np.ndarray,         # (36, 3) precomputed, constant
+    sector_masses: np.ndarray,            # (36,) time-varying
+    tank_positions: np.ndarray,           # (36, 3) precomputed, constant
+    tank_masses: np.ndarray,              # (36,) time-varying (from state)
+    manifold_positions: np.ndarray,       # (3, 3) precomputed, constant
+    manifold_masses: np.ndarray           # (3,) time-varying (from state)
+) -> np.ndarray:
+    """Compute total inertia tensor about geometric centre. Returns (3,3)."""
+
+    I = structural_inertia.copy()
+
+    # Vectorised point-mass contributions: I += Σ m_k * (|r_k|² I₃ - r_k r_kᵀ)
+    # Combine sectors and tanks into one batch for efficiency
+    all_positions = np.concatenate([sector_positions, tank_positions, manifold_positions])
+    all_masses = np.concatenate([sector_masses, tank_masses, manifold_masses])
+
+    # r_squared: (N,) — |r_k|²
+    r_sq = np.sum(all_positions ** 2, axis=1)
+
+    # Outer products: (N, 3, 3) — r_k r_kᵀ
+    outer = all_positions[:, :, None] * all_positions[:, None, :]
+
+    # Weighted sum
+    I += np.sum(all_masses[:, None, None] * (r_sq[:, None, None] * np.eye(3) - outer), axis=0)
+
+    return I
+```
+
+### 5.2 Quaternion Utilities (`core/quaternion.py`)
+
+Minimal, no-allocation implementations.
+
+```python
+def quat_multiply(p, q):
+    """Hamilton product of two quaternions [w, x, y, z]."""
+    ...
+
+def quat_to_rotation_matrix(q):
+    """Convert unit quaternion to 3x3 rotation matrix."""
+    ...
+
+def quat_to_euler_zxz(q):
+    """Extract precession (ψ), nutation (θ), spin (φ) angles."""
+    ...
+
+def omega_matrix(w):
+    """Build 4x4 Ω matrix for quaternion kinematics."""
+    ...
+
+def quat_rotate_vector(q, v):
+    """Rotate vector v by quaternion q. Returns rotated vector."""
+    ...
+```
+
+### 5.3 RK4 with Quaternion Normalisation (`core/integrator.py`)
+
+```python
+def rk4_step(deriv_fn, t, x, *args, dt):
+    """Standard RK4 step. deriv_fn signature: f(t, x, *args) -> dx/dt"""
+    k1 = deriv_fn(t, x, *args)
+    k2 = deriv_fn(t + dt/2, x + dt/2 * k1, *args)
+    k3 = deriv_fn(t + dt/2, x + dt/2 * k2, *args)
+    k4 = deriv_fn(t + dt, x + dt * k3, *args)
+    return x + (dt / 6) * (k1 + 2*k2 + 2*k3 + k4)
+    # Caller is responsible for quaternion normalisation after this returns
+```
+
+### 5.4 Tank System (`actuators/tank_system.py`)
+
+Encapsulates the hybrid manifold logic, constraint enforcement, and axial equalisation.
+
+```python
+class TankSystem:
+
+    def __init__(self, config: TankConfig):
+        self.config = config
+        self.n_per_station = config.n_tanks_per_station  # 12
+        self.n_stations = config.n_stations              # 3
+
+    def compute_tank_derivatives(
+        self,
+        tank_masses: np.ndarray,     # (36,)
+        manifold_masses: np.ndarray, # (3,)
+        valve_commands: np.ndarray   # (36,) in [-1, +1]
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Returns (d_tank_masses/dt, d_manifold_masses/dt).
+        Handles constraint clipping and axial equalisation.
+        """
+        # Circumferential: valve flow per tank
+        flow_rates = valve_commands * self.config.q_circ_max        # (36,)
+
+        # Clip at tank limits (can't drain empty tank, can't overfill full tank)
+        flow_rates = self._clip_at_limits(flow_rates, tank_masses)
+
+        # Manifold drain rates: net flow per station
+        flow_2d = flow_rates.reshape(self.n_stations, self.n_per_station)
+        manifold_drain = -flow_2d.sum(axis=1)                       # (3,)
+
+        # Throttle if manifold would go negative
+        manifold_drain = self._throttle_manifold(manifold_drain, manifold_masses)
+
+        # Axial equalisation: proportional controller on manifold level differences
+        axial_flow = self._axial_equalisation(manifold_masses)       # (3,) net flow per manifold
+
+        d_tanks = flow_rates
+        d_manifolds = manifold_drain + axial_flow
+
+        return d_tanks, d_manifolds
+
+    def _axial_equalisation(self, manifold_masses):
+        """
+        Automatic pressure equalisation between manifolds.
+        Drives manifold levels toward their mean at rate q_axial_max.
+        """
+        mean_level = manifold_masses.mean()
+        error = mean_level - manifold_masses      # positive = under-filled
+        # Proportional transfer, capped at q_axial_max
+        flow = np.clip(error * K_AXIAL, -self.config.q_axial_max, self.config.q_axial_max)
+        # Ensure conservation: flows must sum to zero
+        flow -= flow.mean()
+        return flow
+
+    def enforce_constraints(self, state: SimState):
+        """Hard-clip tanks to [0, max] and fix any conservation drift."""
+        np.clip(state.tank_masses, 0.0, self.config.tank_capacity, out=state.tank_masses)
+        np.clip(state.manifold_masses, 0.0, None, out=state.manifold_masses)
+
+        # Fix total water mass conservation
+        total = state.tank_masses.sum() + state.manifold_masses.sum()
+        drift = total - self.config.total_water_mass
+        # Distribute correction to manifolds proportionally
+        state.manifold_masses -= drift * state.manifold_masses / state.manifold_masses.sum()
+```
+
+### 5.5 Gymnasium Environment (`environment/habitat_env.py`)
+
+Standard Gymnasium interface for SAC compatibility.
+
+```python
+class HabitatEnv(gymnasium.Env):
+
+    metadata = {"render_modes": ["human"]}
+
+    def __init__(self, config: ExperimentConfig):
+        super().__init__()
+        self.config = config
+        self.engine = SimulationEngine(config)
+
+        n_obs = config.sectors.n_total + config.tanks.n_tanks_total + config.tanks.n_stations  # 75 for default cylinder
+        n_act = config.tanks.n_tanks_per_station * config.tanks.n_stations  # 36
+
+        self.observation_space = gymnasium.spaces.Box(
+            low=-np.inf, high=np.inf, shape=(n_obs,), dtype=np.float64
+        )
+        self.action_space = gymnasium.spaces.Box(
+            low=-1.0, high=1.0, shape=(n_act,), dtype=np.float64
+        )
+
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
+        self.engine = SimulationEngine(self.config)
+        obs = self.engine.sensors.observe(
+            self.engine.state,
+            self.engine.scenario.get_sector_masses(0.0)
+        )
+        return obs, {}
+
+    def step(self, action):
+        obs, reward, terminated, info = self.engine.step(action)
+        truncated = False
+        return obs, reward, terminated, truncated, info
+```
+
+---
+
+## 6. Database Schema (`database/schema.py`)
+
+Using SQLite via SQLAlchemy for portability. Three core tables.
+
+```
+┌──────────────────────┐
+│  experiments          │
+├──────────────────────┤
+│  id (PK)             │
+│  name                │
+│  created_at          │
+│  config_json         │  ← full ExperimentConfig serialised
+│  notes               │
+│  dynamics_level      │
+│  status              │  ← "running", "completed", "failed"
+└──────────┬───────────┘
+           │ 1:N
+           ▼
+┌──────────────────────┐
+│  episodes            │
+├──────────────────────┤
+│  id (PK)             │
+│  experiment_id (FK)  │
+│  episode_number      │
+│  total_reward        │
+│  duration            │
+│  seed                │
+│  final_nutation_deg  │  ← summary metrics for fast queries
+│  max_cm_offset_m     │
+│  mean_pump_energy    │
+│  h_conservation_err  │
+└──────────┬───────────┘
+           │ 1:N
+           ▼
+┌──────────────────────┐
+│  snapshots           │
+├──────────────────────┤
+│  id (PK)             │
+│  episode_id (FK)     │
+│  t                   │
+│  state_blob          │  ← full state vector as binary (compact)
+│  observation_blob    │  ← observation vector as binary
+│  action_blob         │  ← action vector as binary
+│  reward              │
+│  h_inertial (3)      │  ← angular momentum in inertial frame
+│  kinetic_energy      │
+│  cm_offset (3)       │
+│  nutation_angle      │
+└──────────────────────┘
+```
+
+Snapshot recording is configurable: every N steps, or at control intervals only, or only at the end. For RL training (thousands of episodes), record only episode-level summaries. For analysis runs, record full time histories.
+
+---
+
+## 7. Extension Points for Levels 2 and 3
+
+### 7.1 State Vector Growth
+
+Level 2 adds modal coordinates and velocities:
+```
+x_L2 = [ ...Level 1 (46)..., η_1, η_2, dη_1/dt, dη_2/dt ]   (50 states)
+```
+
+Level 3:
+```
+x_L3 = [ ...Level 1 (46)..., η_1..η_20, dη_1/dt..dη_20/dt ]  (86 states)
+```
+
+The `SimState` class reads the state dimension from config and adjusts index maps.
+
+### 7.2 Dynamics Model Swap
+
+```python
+def create_dynamics(level: int) -> DynamicsModel:
+    if level == 1:
+        return RigidBodyDynamics()
+    elif level == 2:
+        return Modal2Dynamics()
+    elif level == 3:
+        return Modal20Dynamics()
+```
+
+The integrator and engine code are unchanged. Only the `compute_derivatives` implementation differs.
+
+### 7.3 Observation Space Growth
+
+Level 2+ adds vibration content to the strain gauge readings via the Euler acceleration term (`dω/dt × r`). Modal oscillations produce time-varying angular accelerations that modulate the force pattern around the ring, so the agent receives vibration information implicitly through the existing 36-gauge observation without requiring additional sensor channels.
+
+---
+
+## 8. Testing Strategy
+
+### 8.1 Unit Tests — Physics
+
+| Test | Validates |
+|------|-----------|
+| Torque-free symmetric spinner | ω_z = const, ω_x = ω_y = 0, H conserved |
+| Torque-free asymmetric spinner | Nutation at predicted frequency, H conserved |
+| Spin-up to target rate | ω_z reaches target, correct time |
+| Single mass imbalance | CM offset correct, conical whirl at spin rate |
+| Tank transfer | Water conservation exact, manifold levels equalise |
+| Quaternion norm preservation | \|q\| = 1 after long integration |
+
+### 8.2 Integration Tests
+
+| Test | Validates |
+|------|-----------|
+| Full episode with no control | Physics runs, conservation holds, data records |
+| Full episode with random actions | No crashes, constraints enforced, DB populated |
+| Gymnasium env check | `gymnasium.utils.env_checker.check_env(env)` passes |
+| Config round-trip | Save config to JSON, reload, run identical simulation |
+
+### 8.3 Benchmark Tests
+
+| Test | Target |
+|------|--------|
+| 1-hour simulation at 100 Hz (Level 1, Python) | < 10 seconds wall clock |
+| 1000 episodes (Level 1, Python) | < 3 hours |
+| Config sweep: 100 geometries | Parallelisable, linear scaling |
+
+---
+
+## 9. Dependencies
+
+```
+# Core
+numpy >= 1.24
+scipy >= 1.10          # for fallback integrators if needed
+
+# RL
+gymnasium >= 0.29
+stable-baselines3 >= 2.0
+torch >= 2.0
+
+# Database
+sqlalchemy >= 2.0
+alembic                # schema migrations
+
+# Visualization
+matplotlib >= 3.7
+
+# Configuration
+pyyaml
+pydantic >= 2.0        # for config validation (alternative to raw dataclasses)
+
+# Testing
+pytest
+pytest-benchmark
+```
+
+---
+
+## 10. Implementation Order
+
+The build sequence is designed so each step produces a testable, runnable artifact.
+
+### Phase 1: Physics Core (can simulate and plot)
+1. `config.py` — dataclasses with a reference cylinder config
+2. `core/quaternion.py` — with unit tests
+3. `core/inertia.py` — with unit tests against hand calculations
+4. `geometry/cylinder.py` — structural inertia for the reference cylinder
+5. `dynamics/rigid_body.py` — Euler equations, Level 1
+6. `core/integrator.py` — RK4
+7. `simulation/state.py` — state vector management
+8. `actuators/motor.py` — torque profiles
+9. `simulation/engine.py` — minimal engine (no tanks, no sensors, no disturbances)
+10. `simulation/monitors.py` — conservation checks
+11. **Milestone: torque-free spinner test passes, spin-up test passes**
+
+### Phase 2: Disturbances and Tanks (can simulate with mass movement and control)
+12. `disturbances/mass_schedule.py` — prescribed crew movement
+13. `actuators/tank_system.py` — 36 tanks + hybrid manifold
+14. Update `dynamics/rigid_body.py` to include tank mass in inertia computation
+15. Update `simulation/engine.py` with full step logic
+16. **Milestone: mass imbalance produces correct conical whirl, tanks can correct it**
+
+### Phase 3: Sensors and Environment (can train RL agent)
+17. `sensors/strain_gauge.py`
+18. `sensors/sensor_suite.py`
+19. `environment/habitat_env.py`
+20. Gymnasium env check passes
+21. **Milestone: random agent runs episodes, observations and actions are correct shapes**
+
+### Phase 4: RL Training
+22. `control/sac_agent.py` — wrap SB3
+23. `control/training.py` — training loop with logging
+24. **Milestone: agent trains, reward improves over episodes**
+
+### Phase 5: Database and Analysis
+25. `database/schema.py`
+26. `database/recorder.py`
+27. `database/queries.py`
+28. `visualization/plots.py`
+29. **Milestone: experiments stored, time series extractable, plots generated**
+
+### Phase 6: Extended Geometry and Scenarios
+30. `geometry/ring.py`, `geometry/toroid.py`
+31. `disturbances/stochastic.py`
+32. `disturbances/scenario.py` — composite scenarios
+33. `visualization/scene_3d.py`
+To design physical experiments validating the SAC-trained vibration control model for the rotating space habitat, focus on replicating key simulation dynamics at a 1:20 scaled-down level. The model minimizes transverse angular velocities (wobble/nutation), energy consumption, jerky actions, and tank imbalances while maintaining stability under disturbances. Physical validation requires a benchtop prototype capturing relative motions, though gravity scaling differs (dynamics faster due to smaller size/mass).
+
+### 1. **Model Objectives and Key Metrics**
+- **Objectives**: Suppress vibrations from mass imbalances and external forces using water tank redistribution; maintain balanced tank levels; minimize control effort.
+- **Key Metrics**: Total episode reward (penalty-based on wobble, energy, smoothness, imbalance); nutation angle (degrees); center-of-mass (CM) offset magnitude; episode duration; angular velocities (ω_x, ω_y, ω_z).
+
+### 2. **Scaling Factors for Physical Prototype (1:20 Scaling)**
+- **Size Scaling**: Simulation cylinder (R=10m, L=20m) scaled to 1:20 (R=0.5m, L=1m) for benchtop feasibility; volume scales 1:8000.
+- **Mass Scaling**: Simulation total mass ~26,000kg (structural + water) scaled to ~3-5kg (maintains inertia ratios for dynamics; e.g., I_physical / I_sim ≈ 1:32,500, but relative torques preserved).
+- **Rotation Speed**: Maintain similar angular velocities (1-10 rad/s) for comparable dynamics; centrifugal stress negligible at this scale.
+- **Time Scaling**: Episode duration (60s sim) kept at 60s physical (dynamics faster, but match for validation); control loop at 10-50Hz.
+- **Force Scaling**: Control forces (tank water movement) scaled proportionally; disturbances (e.g., 50-200kg sim imbalance) to 6-25g physical (but use 20-100g for measurability and effect).
+
+### 3. **Physical Habitat Prototype Design**
+- **Geometry**: Cylindrical shell with rim for tanks; PVC or acrylic tubing for structure.
+- **Materials**: PVC pipe (R=0.5m, L=1m, wall thickness 2-3mm); aluminum end caps; total mass 3-4kg empty + 0.5kg water.
+- **Rotation Mechanism**: Brushless DC motor (200-500W) with encoder; mounted on precision bearings for low-friction spin; variable speed control (0-10 rad/s).
+- **Structural Integrity**: Reinforce rim for tank mounting; balance to <0.1° wobble at max speed.
+
+### 4. **Disturbance Scenarios**
+- **Mass Imbalances**: Attach removable weights (20-100g) to 12 angular sectors (simulating scaled crew/cargo); apply randomly or progressively (e.g., 1 sector at 25% episode, 3 at 50%).
+- **External Forces**: Impulse from solenoid or air jet (scaled micro-impacts); stochastic timing.
+- **Motor Spin-Up**: Ramp rotation from 0 to target speed during episode to test stability under acceleration.
+
+### 5. **Sensors Selection and Integration**
+- **Strain Gauges (Primary Control Sensor)**: One strain gauge embedded in the floor of each of the 36 sectors, measuring compressive normal force from the mass above. This matches the simulation sensor model exactly — the control agent observes force readings, not accelerations. Sample at 100 Hz; noise level tunable to match `strain_gauge_noise_std` in config.
+- **Angular Velocity (State Estimation / Safety)**: High-precision 6-axis IMU (e.g., MPU-6050 or better) at geometric centre for ω_x, ω_y, ω_z; sample at 100–200 Hz. Used for state monitoring and safety limits, not as a direct RL observation.
+- **Motor Encoder**: On motor shaft for spin rate (ω_z) ground truth.
+- **Optional**: Optical or capacitive sensors for tank fill levels if direct measurement is needed for validation.
+
+### 6. **Actuators Implementation**
+- **Water Tanks**: 36 syringes or small pumps (20-50mL capacity each, scaled from 100kg sim) arranged in rim; manifolds for redistribution.
+- **Control Mechanism**: Pumps driven by PWM signals from microcontroller; simulate valve actions with bidirectional flow.
+- **Alternative (Simplified)**: Linear actuators moving masses radially instead of water, if fluid dynamics are hard to replicate.
+
+### 7. **Data Acquisition and Control System**
+- **Hardware**: Raspberry Pi 4 or Arduino Mega for control; ADC shields for sensors; motor driver (e.g., ESC); more powerful than 1:100 scale for handling larger prototype.
+- **Software**: Python with GPIO/serial for sensor reading; implement SAC inference (export model to ONNX/TFLite for real-time); log data to CSV/SQLite.
+- **Real-Time Loop**: 10-50Hz control loop; collect ω, CM offset, tank masses; compute actions; apply to actuators.
+- **Telemetry**: Stream data wirelessly (WiFi/Bluetooth) for monitoring; store episodes for analysis.
+
+### 8. **Experimental Protocols**
+- **Episode Structure**: 60s duration; start spinning; apply disturbances at set times; run control; measure stability.
+- **Test Sequences**:
+  - Baseline: No control, measure natural decay.
+  - Controlled: Apply trained SAC actions; compare to sim.
+  - Curriculum: Progressive disturbances (no imbalance → small → large).
+  - Replicates: 10 episodes per condition; average metrics.
+- **Data Collection**: Log time-series of ω, nutation, CM offset, actions, rewards; post-process for curves.
+
+### 9. **Validation Criteria**
+- **Similarity Thresholds**: Physical nutation < 2× sim value; CM offset < 1.5× sim; reward within 20% (accounting for scaling/noise).
+- **Error Tolerances**: Sensor noise < 5% of signal; actuator precision < 10% of command.
+- **Success Metrics**: Control reduces wobble by >50% vs. uncontrolled; matches sim trends (e.g., curriculum phases).
+- **Statistical Validation**: t-tests on means; correlation >0.8 for key variables vs. sim.
+
+### 10. **Safety and Operational Procedures**
+- **Mechanical Safety**: Enclose prototype in sturdy cage (larger size increases kinetic energy); limit speed to <5 rad/s initially; emergency stop button; secure mounting to prevent tipping.
+- **Electrical Safety**: Low-voltage (<24V); fuse-protected; ground all electronics.
+- **Operational Checks**: Balance check before spin; sensor calibration; dry runs without disturbances; monitor for excessive vibrations.
+- **Supervision**: Always attended; have shutdown protocols; larger scale requires more space and caution to avoid injury from moving parts.
+
+This 1:20 scaling provides a more robust prototype (easier assembly, higher fidelity sensors/actuators) while remaining benchtop. Implications include faster dynamics (shorter effective time constants), lower mass requiring precise balancing, and higher build cost (~$1000-2000). Validate iteratively, starting with no disturbances.
+# Training for Spin-up #
+
+To train the model for balancing during spin-up in this vibration control simulation, modify the training configuration to enable motor spin-up instead of keeping it "off". The current setup in `run_training()` sets the motor profile to "off" for both training and evaluation environments, which prevents spin-up dynamics. Change this to use a profile like "ramp" or "trapezoidal" to simulate the motor accelerating to target spin rate over time.
+
+For example, update the training code to:
+- Set `train_cfg.motor = MotorConfig(profile="ramp")` instead of "off"
+- Adjust the curriculum callback to include spin-up phases, potentially starting with low spin rates and ramping up
+
+The existing SAC reward function already penalizes transverse angular velocity (wobble), so the agent will learn to use water tank actuators to minimize vibrations as spin rate increases. Train with the curriculum that progressively adds imbalance disturbances while the motor spins up.
+
+To summarize results in the database, use the existing `ExperimentRecorder` which stores episode-level metrics (total reward, final nutation angle, CM offset) and per-timestep data (omega components, CM offset magnitude, etc.). For aggregation:
+
+- Use `get_reward_curve()` to plot reward progression over episodes
+- Use `get_nutation_curve()` to track nutation reduction
+- Query episode summaries with SQLAlchemy to compute averages, standard deviations, or best-performing episodes
+- For spin-up specific metrics, add custom queries to analyze omega_z (spin rate) evolution and vibration stability during ramp-up phases
+
+The database schema supports detailed telemetry, so you can filter timesteps by time ranges corresponding to spin-up periods and compute metrics like maximum nutation during acceleration.
+
+
+# Training with background processes #
+To kick off a training run in the background and periodically check its progress in this vibration control project, follow these steps. The training uses the SAC (Soft Actor-Critic) algorithm via Stable Baselines3, orchestrated through the `habitat_sim/scripts/train_agent.py` script.
+
+### 1. **Starting the Training Run in the Background**
+The training script (`habitat_sim/scripts/train_agent.py`) runs synchronously by default, blocking the terminal until completion. To run it in the background:
+
+- **On Windows (PowerShell, which is your default shell):**
+  Use `Start-Job` to run the script as a background job.
+  ```
+  $job = Start-Job -ScriptBlock { python habitat_sim/scripts/train_agent.py --config path/to/config.json --timesteps 1000000 --log-dir ./logs/training_run }
+  ```
+  - Replace `path/to/config.json` with your experiment config file (e.g., `habitat_sim/configs/reference_config.json`).
+  - Adjust other arguments like `--timesteps`, `--n-envs`, etc., as needed (see the script's help with `python habitat_sim/scripts/train_agent.py --help`).
+  - The job runs asynchronously, and you can continue using the terminal.
+
+- **Alternative: Use `&` if in a bash-like environment (e.g., via WSL or Git Bash):**
+  ```
+  python habitat_sim/scripts/train_agent.py --config path/to/config.json --timesteps 1000000 --log-dir ./logs/training_run &
+  ```
+
+The training will log progress to the console (if not redirected) and save models/checkpoints to the specified `--log-dir`.
+
+### 2. **Periodically Interrogating Progress**
+The training process provides several ways to monitor progress without interrupting it:
+
+- **Check Job Status (PowerShell):**
+  ```
+  Get-Job -Id $job.Id
+  ```
+  - This shows if the job is running, completed, or failed. For detailed output, use `Receive-Job -Id $job.Id -Keep` (keeps the output buffered).
+
+- **Monitor Log Files:**
+  - Training logs are written to the `--log-dir` (e.g., `./logs/training_run`).
+  - Look for files like `progress.csv` or TensorBoard logs in `tb/` subdirectory (if TensorBoard is installed).
+  - The script uses `log_interval=10`, so progress is logged every 10 training steps. Check the console output or log files for updates like:
+    ```
+    ---------------------------------
+    | rollout/           |          |
+    |    ep_len_mean     | 1e+03    |
+    |    ep_rew_mean     | -1.23    |
+    | time/              |          |
+    |    fps             | 123      |
+    |    iterations      | 10       |
+    |    time_elapsed    | 456      |
+    |    total_timesteps | 10000    |
+    ---------------------------------
+    ```
+  - Periodically run `Get-Content ./logs/training_run/progress.csv | Select-Object -Last 10` to see recent logs.
+
+- **Check for Checkpoints and Models:**
+  - Checkpoints are saved every `checkpoint_freq` steps (default from config) to `./logs/training_run/checkpoints/`.
+  - The best model is saved to `./logs/training_run/best_model.zip` when evaluation improves.
+  - Run a script periodically to list files: `Get-ChildItem ./logs/training_run/checkpoints | Sort-Object LastWriteTime -Descending | Select-Object -First 5` to see recent checkpoints.
+
+- **TensorBoard Monitoring (if installed):**
+  - If TensorBoard is available, start it in another terminal: `tensorboard --logdir ./logs/training_run/tb`.
+  - Access via browser at `http://localhost:6006` to view real-time metrics like rewards, losses, and episode lengths.
+
+- **Database Recording (if enabled):**
+  - If using `--db path/to/database.db`, progress is recorded to an SQLite database. Query it periodically with SQL tools or scripts to check metrics.
+
+- **Automated Polling:**
+  - Write a simple PowerShell script to check progress every few minutes:
+    ```
+    while ($true) {
+        $latestCheckpoint = Get-ChildItem ./logs/training_run/checkpoints | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+        Write-Host "Latest checkpoint: $($latestCheckpoint.Name) at $($latestCheckpoint.LastWriteTime)"
+        Start-Sleep -Seconds 300  # Check every 5 minutes
+    }
+    ```
+
+Training can take hours or days depending on `total_timesteps`. If the job fails, check the job's error output with `Receive-Job -Id $job.Id`. For more details, refer to the [training addendum](docs/training_addendum.md) or config files.
+# User Guide: Rotating Space Habitat Simulation
+
+## Introduction and Overview
+
+The Rotating Space Habitat Simulation is a Python-based framework for modeling the dynamics of a rotating space habitat in microgravity. It simulates rigid body physics, disturbances from crew and cargo movements, and active vibration control using a system of rim-mounted water tanks. The simulation includes reinforcement learning (RL) capabilities to train an agent that autonomously stabilizes the habitat by redistributing water mass.
+
+### Key Features
+
+- **Physics Simulation**: Rigid body dynamics with quaternion-based orientation tracking, inertia tensor computation, and RK4 integration.
+- **Disturbances**: Prescribed or stochastic crew/cargo movements, micro-impacts, and mass imbalances.
+- **Control System**: 36 rim water tanks connected via manifolds for mass redistribution, controlled by a Soft Actor-Critic (SAC) RL agent.
+- **Sensors**: 36 strain gauges — one per sector floor — measuring compressive normal force from crew/cargo mass, encoding both occupancy and nutation state.
+- **RL Training**: Integration with Stable Baselines3 for training and evaluation.
+- **Database Logging**: SQLite-based storage of experiments, episodes, and timesteps for analysis.
+- **CLI Tools**: Command-line interfaces for training, simulation, and analysis.
+- **Extensibility**: Support for different habitat geometries (cylinder, ring, toroid) and future vibration modes.
+
+### Use Cases
+
+- Research in spacecraft dynamics and vibration control.
+- RL algorithm development for continuous control tasks.
+- Educational simulations of artificial gravity and orbital mechanics.
+
+### Architecture Overview
+
+The simulation is built around a modular architecture:
+
+- **Core**: Quaternion math, inertia computation, RK4 integrator.
+- **Geometry**: Habitat shapes (cylinder, ring, toroid) with structural inertia.
+- **Dynamics**: Rigid body equations with variable inertia.
+- **Actuators**: Tank system with hybrid manifolds.
+- **Sensors**: Strain gauge array (floor force sensors, one per sector).
+- **Disturbances**: Mass schedules and stochastic events.
+- **Environment**: Gymnasium-compatible RL environment.
+- **Control**: SAC agent and training pipeline.
+- **Database**: Experiment logging and querying.
+- **Scripts**: CLI entry points.
+
+Data flows from configuration to simulation engine, through physics integration, to RL agent actions, with optional logging to database.
+
+## Installation and Setup
+
+### Prerequisites
+
+- Python 3.10 or later
+- Windows, macOS, or Linux
+
+### Virtual Environment
+
+Create and activate a virtual environment:
+
+```bash
+python -m venv .venv
+# Windows
+.venv\Scripts\activate
+# Linux/macOS
+source .venv/bin/activate
+```
+
+### Install the Package
+
+Install core dependencies (numpy, scipy):
+
+```bash
+pip install -e .
+```
+
+For RL training:
+
+```bash
+pip install -e ".[rl]"
+```
+
+For database and visualization:
+
+```bash
+pip install -e ".[db,viz]"
+```
+
+For everything:
+
+```bash
+pip install -e ".[all]"
+```
+
+### Windows Long Paths
+
+If installing torch fails due to path length, enable long paths:
+
+```powershell
+# Run as Administrator
+Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" -Name "LongPathsEnabled" -Value 1
+```
+
+Restart your terminal and retry.
+
+### Verify Installation
+
+Run tests:
+
+```bash
+pytest
+```
+
+All 113 tests should pass.
+
+## Quick Start
+
+### Run Demos
+
+Execute the quick simulation script:
+
+```bash
+python scripts/quick_sim.py
+```
+
+This runs four demos:
+- Torque-free conservation check
+- Mass imbalance whirl
+- Tank correction
+- Random Gymnasium agent episode
+
+### Train an Agent
+
+Train a SAC agent for 500,000 timesteps:
+
+```bash
+habitat-train --timesteps 500000 --n-envs 4 --log-dir ./runs/my_run
+```
+
+Record to database:
+
+```bash
+habitat-train --timesteps 500000 --db habitat.db --experiment-name my_run
+```
+
+### Analyze Results
+
+Plot training metrics:
+
+```bash
+python -m habitat_sim.scripts.analyse_experiment --db habitat.db --experiment-id 1
+```
+
+## Configuration
+
+All parameters are defined in `habitat_sim/config.py` as dataclasses. The `ExperimentConfig` bundles sub-configs and supports JSON serialization.
+
+### Reference Configuration
+
+Load defaults:
+
+```python
+from habitat_sim.config import reference_config
+
+cfg = reference_config()
+```
+
+### Sub-Configurations
+
+- **HabitatConfig**: Geometry (shape, radius, length, wall density).
+- **SectorConfig**: Angular and axial sector grid (n_angular=12, n_axial=3).
+- **TankConfig**: Tank count, capacity, flow rates.
+- **MotorConfig**: Spin motor torque profiles.
+- **SensorConfig**: Strain gauge noise level (`strain_gauge_noise_std`, N per gauge).
+- **SimulationConfig**: Timesteps, durations.
+- **RLConfig**: SAC hyperparameters, curriculum.
+- **StochasticConfig**: Poisson crew and micro-impacts.
+
+### Modifying Config
+
+Override fields directly:
+
+```python
+cfg.rl.total_timesteps = 250_000
+cfg.stochastic.poisson_crew = True
+```
+
+Serialize to JSON:
+
+```python
+print(cfg.to_json())
+```
+
+Load from JSON:
+
+```python
+cfg = ExperimentConfig.from_dict(json.loads(json_str))
+```
+
+### Toroid Geometry Example
+
+Switch to toroid shape:
+
+```python
+from habitat_sim.config import reference_config
+from dataclasses import replace
+
+cfg = reference_config()
+cfg.habitat = replace(cfg.habitat, shape="toroid", minor_radius=5.0)
+cfg.sectors = SectorConfig(n_angular=12, n_axial=1)
+cfg.tanks = replace(cfg.tanks, n_tanks_per_station=12, n_stations=1)
+```
+
+## Running Simulations and Demos
+
+### CLI: habitat-run
+
+Run demos or evaluate models:
+
+```bash
+# Run all demos
+habitat-run --demo all
+
+# Run specific demo
+habitat-run --demo imbalance
+
+# Evaluate trained model
+habitat-run --model ./runs/best_model/best_model.zip --episodes 10
+```
+
+Available demos:
+- `torque-free`: Conservation laws check.
+- `imbalance`: Mass offset whirl.
+- `tank`: Active correction.
+- `random-agent`: Gymnasium episode.
+
+### Programmatic Simulation
+
+```python
+from habitat_sim.config import reference_config
+from habitat_sim.environment.habitat_env import HabitatEnv
+import numpy as np
+
+cfg = reference_config()
+env = HabitatEnv(config=cfg)
+obs, _ = env.reset(seed=42)
+
+for _ in range(100):
+    action = np.zeros(36)  # No control
+    obs, reward, terminated, truncated, info = env.step(action)
+    if terminated or truncated:
+        break
+
+print(f"Final nutation: {info['nutation_angle_deg']:.2f}°")
+env.close()
+```
+
+### Simulation Engine
+
+Direct engine access:
+
+```python
+from habitat_sim.simulation.engine import SimulationEngine
+
+engine = SimulationEngine(cfg)
+obs = engine.reset(seed=42)
+
+for _ in range(100):
+    obs, info = engine.step(np.zeros(36))
+
+print(f"CM offset: {engine.get_cm_offset_magnitude():.4f} m")
+```
+
+## Training Agents
+
+### CLI Training
+
+```bash
+habitat-train --timesteps 500000 --n-envs 4 --log-dir ./runs/my_run
+```
+
+Options:
+- `--config`: JSON config file.
+- `--timesteps`: Total training steps.
+- `--n-envs`: Parallel environments.
+- `--log-dir`: Output directory.
+- `--seed`: Random seed.
+- `--no-curriculum`: Disable progressive difficulty.
+- `--db`: SQLite database path.
+- `--experiment-name`: Experiment name for DB.
+
+### Programmatic Training
+
+```python
+from habitat_sim.config import reference_config
+from habitat_sim.control.training import run_training
+
+cfg = reference_config()
+cfg.rl.total_timesteps = 500_000
+cfg.rl.n_envs = 4
+
+model = run_training(cfg)
+```
+
+With database logging:
+
+```python
+from habitat_sim.database.recorder import ExperimentRecorder
+
+with ExperimentRecorder("habitat.db", "my_experiment", cfg) as rec:
+    model = run_training(cfg, recorder=rec)
+```
+
+### Curriculum Learning
+
+Enabled by default, ramps imbalance mass: 0kg → 50kg → 150kg → 200kg over training.
+
+### Evaluation
+
+```python
+from habitat_sim.control.training import evaluate_agent
+
+results = evaluate_agent("./runs/best_model/best_model.zip", cfg, n_episodes=10)
+print(f"Mean reward: {results['mean_reward']:.2f}")
+print(f"Mean nutation: {results['mean_nutation_deg']:.3f}°")
+```
+
+## Analyzing Experiments
+
+### Database Queries
+
+```python
+from habitat_sim.database.queries import list_experiments, get_reward_curve
+
+experiments = list_experiments("habitat.db")
+curve = get_reward_curve("habitat.db", experiment_id=1)
+```
+
+### CLI Analysis
+
+```bash
+python -m habitat_sim.scripts.analyse_experiment --db habitat.db --experiment-id 1 --out-dir ./plots
+```
+
+Generates plots:
+- Episode reward over time.
+- Final nutation per episode.
+- H-violation count.
+
+### Custom Queries
+
+```python
+from habitat_sim.database.queries import get_nutation_curve, get_conservation_summary
+
+nutation = get_nutation_curve("habitat.db", 1)
+conservation = get_conservation_summary("habitat.db", 1)
+```
+
+## API Reference
+
+### Key Classes
+
+#### `ExperimentConfig`
+
+Top-level configuration.
+
+- `from_dict(d)`: Load from dict.
+- `to_json()`: Serialize to JSON.
+
+#### `SimulationEngine`
+
+Core simulator.
+
+- `__init__(config)`: Initialize with config.
+- `reset(seed)`: Reset simulation.
+- `step(action)`: Advance by control_dt, return obs, info.
+- `get_cm_offset_magnitude()`: Current CM offset.
+
+#### `HabitatEnv`
+
+Gymnasium environment.
+
+- `__init__(config)`: Initialize.
+- `reset(seed)`: Reset, return obs, info.
+- `step(action)`: Step, return obs, reward, terminated, truncated, info.
+
+#### `ExperimentRecorder`
+
+Database logger.
+
+- `__enter__()`: Start recording.
+- `record_episode(episode_num, steps_data, engine_info)`: Log episode.
+- `__exit__()`: Flush.
+
+### Key Functions
+
+#### `run_training(config, recorder=None)`
+
+Train SAC agent.
+
+#### `evaluate_agent(model_path, config, n_episodes)`
+
+Evaluate trained model.
+
+#### `build_scenario_from_stochastic_config(stochastic_cfg, n_sectors, seed)`
+
+Create stochastic disturbance scenario.
+
+## Troubleshooting and FAQ
+
+### Common Issues
+
+**Torch installation fails on Windows**: Enable long paths as described in installation.
+
+**Tests fail**: Ensure all extras are installed (`pip install -e ".[all]"`).
+
+**RL training slow**: Reduce `n_envs` or timesteps.
+
+**Database errors**: Ensure SQLite is available; use `:memory:` for testing.
+
+### Performance Tips
+
+- Use multiple environments (`n_envs > 1`) for parallel training.
+- For evaluation, use deterministic policy.
+- Simulation is CPU-bound; no GPU acceleration yet.
+
+### Units and Conventions
+
+- Length: meters
+- Mass: kg
+- Time: seconds
+- Angles: radians (displayed in degrees where noted)
+- Spin rate: rad/s (rpm in outputs)
+
+### Extending the Codebase
+
+See `IMPLEMENTATION_GUIDE.md` for adding features like vibration modes or new geometries.
+
+For issues or contributions, refer to the project repository.

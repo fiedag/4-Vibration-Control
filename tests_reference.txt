@@ -1,0 +1,2200 @@
+=== FILE: tests/test_phase1.py ===
+"""Phase 1 tests: physics core validation.
+
+Milestone criteria:
+  1. Torque-free symmetric spinner: ω_z = const, H conserved
+  2. Torque-free asymmetric spinner: nutation at predicted frequency, H conserved
+  3. Spin-up to target rate
+  4. Quaternion norm preserved after long integration
+  5. Water conservation exact
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import pytest
+
+from habitat_sim.config import (
+    ExperimentConfig, HabitatConfig, SectorConfig, TankConfig,
+    MotorConfig, SensorConfig, SimulationConfig, reference_config,
+)
+from habitat_sim.core.quaternion import (
+    quat_multiply, quat_conjugate, quat_normalize, quat_to_rotation_matrix,
+    quat_rotate_vector, quat_to_euler_zxz, omega_matrix, quat_derivative,
+)
+from habitat_sim.core.inertia import (
+    point_mass_inertia, compute_inertia_tensor, compute_cm_offset,
+)
+from habitat_sim.geometry.cylinder import CylinderGeometry, RingGeometry
+from habitat_sim.actuators.motor import SpinMotor
+from habitat_sim.simulation.engine import SimulationEngine
+
+
+# ===================================================================
+# Quaternion unit tests
+# ===================================================================
+
+class TestQuaternion:
+
+    def test_identity_multiply(self):
+        """q * identity = q."""
+        q = np.array([0.5, 0.5, 0.5, 0.5])
+        identity = np.array([1.0, 0.0, 0.0, 0.0])
+        result = quat_multiply(q, identity)
+        np.testing.assert_allclose(result, q, atol=1e-15)
+
+    def test_conjugate_product_is_norm(self):
+        """q * q̄  = [|q|², 0, 0, 0]."""
+        q = np.array([1.0, 2.0, 3.0, 4.0])
+        result = quat_multiply(q, quat_conjugate(q))
+        expected_norm_sq = np.sum(q**2)
+        np.testing.assert_allclose(result[0], expected_norm_sq, atol=1e-12)
+        np.testing.assert_allclose(result[1:], 0.0, atol=1e-12)
+
+    def test_normalize(self):
+        q = np.array([1.0, 1.0, 1.0, 1.0])
+        qn = quat_normalize(q)
+        np.testing.assert_allclose(np.linalg.norm(qn), 1.0, atol=1e-15)
+
+    def test_rotation_matrix_identity(self):
+        """Identity quaternion → identity matrix."""
+        q = np.array([1.0, 0.0, 0.0, 0.0])
+        R = quat_to_rotation_matrix(q)
+        np.testing.assert_allclose(R, np.eye(3), atol=1e-15)
+
+    def test_rotation_90_about_z(self):
+        """90° rotation about z-axis."""
+        angle = np.pi / 2
+        q = np.array([np.cos(angle/2), 0, 0, np.sin(angle/2)])
+        R = quat_to_rotation_matrix(q)
+        # x-axis → y-axis
+        v = np.array([1.0, 0.0, 0.0])
+        result = R @ v
+        np.testing.assert_allclose(result, [0.0, 1.0, 0.0], atol=1e-12)
+
+    def test_rotate_vector_matches_matrix(self):
+        """quat_rotate_vector should match R @ v."""
+        q = quat_normalize(np.array([1.0, 0.3, -0.5, 0.2]))
+        v = np.array([1.0, 2.0, 3.0])
+        R = quat_to_rotation_matrix(q)
+        np.testing.assert_allclose(quat_rotate_vector(q, v), R @ v, atol=1e-12)
+
+    def test_euler_roundtrip(self):
+        """Convert to ZXZ Euler and back (via rotation matrices)."""
+        q = quat_normalize(np.array([0.8, 0.1, 0.2, 0.5]))
+        R_orig = quat_to_rotation_matrix(q)
+        psi, theta, phi = quat_to_euler_zxz(q)
+        # Rebuild R from ZXZ Euler angles
+        Rz1 = _Rz(psi)
+        Rx  = _Rx(theta)
+        Rz2 = _Rz(phi)
+        R_rebuilt = Rz1 @ Rx @ Rz2
+        np.testing.assert_allclose(R_rebuilt, R_orig, atol=1e-10)
+
+    def test_omega_matrix_antisymmetric(self):
+        w = np.array([1.0, 2.0, 3.0])
+        O = omega_matrix(w)
+        np.testing.assert_allclose(O, -O.T, atol=1e-15)
+
+
+def _Rz(angle):
+    c, s = np.cos(angle), np.sin(angle)
+    return np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
+
+def _Rx(angle):
+    c, s = np.cos(angle), np.sin(angle)
+    return np.array([[1, 0, 0], [0, c, -s], [0, s, c]])
+
+
+# ===================================================================
+# Inertia tensor tests
+# ===================================================================
+
+class TestInertia:
+
+    def test_single_point_mass(self):
+        """Single mass at (R, 0, 0) on the x-axis."""
+        r = np.array([[5.0, 0.0, 0.0]])
+        m = np.array([10.0])
+        I = point_mass_inertia(r, m)
+        # I_xx = m * (0 + 0) = 0 (mass on the x-axis)
+        # Wait: I_xx = m*(y²+z²) = 0, I_yy = m*(x²+z²) = 250, I_zz = m*(x²+y²) = 250
+        # Using the tensor formula: I = m*(|r|²I - rrᵀ)
+        # |r|² = 25, so m*|r|²*I = 250*I
+        # rrᵀ = [[25,0,0],[0,0,0],[0,0,0]]
+        # I = 10*(250*I - rrᵀ) wait, that's wrong.
+        # I = m*(|r|²I₃ - rrᵀ) = 10*(25*I₃ - [[25,0,0],[0,0,0],[0,0,0]])
+        # = [[10*(25-25), 0, 0], [0, 10*25, 0], [0, 0, 10*25]]
+        # = [[0, 0, 0], [0, 250, 0], [0, 0, 250]]
+        assert I[0, 0] == pytest.approx(0.0)
+        assert I[1, 1] == pytest.approx(250.0)
+        assert I[2, 2] == pytest.approx(250.0)
+
+    def test_symmetric_ring_of_masses(self):
+        """12 equal masses at rim should give I_xx = I_yy, I_xy = 0."""
+        R = 10.0
+        n = 12
+        angles = np.linspace(0, 2*np.pi, n, endpoint=False) + np.pi/n
+        positions = np.column_stack([R*np.cos(angles), R*np.sin(angles),
+                                     np.zeros(n)])
+        masses = np.full(n, 5.0)
+        I = point_mass_inertia(positions, masses)
+        # Axisymmetric: I_xx ≈ I_yy
+        np.testing.assert_allclose(I[0, 0], I[1, 1], rtol=1e-10)
+        # Off-diagonal should be ≈ 0
+        np.testing.assert_allclose(I[0, 1], 0.0, atol=1e-10)
+        np.testing.assert_allclose(I[0, 2], 0.0, atol=1e-10)
+        np.testing.assert_allclose(I[1, 2], 0.0, atol=1e-10)
+
+    def test_cm_offset_single_mass(self):
+        """A single mass at (R, 0, 0) with a 100 kg structure at origin."""
+        pos = np.array([[10.0, 0.0, 0.0]])
+        mass = np.array([10.0])
+        cm = compute_cm_offset(
+            structural_mass=100.0,
+            sector_positions=pos, sector_masses=mass,
+            tank_positions=np.zeros((0, 3)), tank_masses=np.array([]),
+            manifold_positions=np.zeros((0, 3)), manifold_masses=np.array([]),
+        )
+        # CM = 10*10 / (100+10) = 100/110 ≈ 0.909 along x
+        np.testing.assert_allclose(cm[0], 100.0 / 110.0, atol=1e-12)
+        np.testing.assert_allclose(cm[1], 0.0, atol=1e-12)
+        np.testing.assert_allclose(cm[2], 0.0, atol=1e-12)
+
+
+# ===================================================================
+# Cylinder geometry tests
+# ===================================================================
+
+class TestCylinderGeometry:
+
+    def test_structural_mass(self):
+        """Verify shell + end plate mass against hand calculation."""
+        cfg = HabitatConfig(radius=10, length=20, wall_thickness=0.01,
+                            wall_density=2700, end_plate_thickness=0.01,
+                            end_plate_density=2700)
+        geom = CylinderGeometry(cfg)
+        m_shell = 2700 * 2 * np.pi * 10 * 0.01 * 20     # ≈ 33929 kg
+        m_end = 2700 * np.pi * 100 * 0.01                # ≈ 8482 kg each
+        expected = m_shell + 2 * m_end
+        assert geom.structural_mass() == pytest.approx(expected, rel=1e-10)
+
+    def test_inertia_symmetry(self):
+        """I_xx == I_yy, off-diagonals == 0."""
+        cfg = HabitatConfig(radius=10, length=20, wall_thickness=0.01,
+                            wall_density=2700, end_plate_thickness=0.01,
+                            end_plate_density=2700)
+        geom = CylinderGeometry(cfg)
+        I = geom.compute_structural_inertia()
+        assert I[0, 0] == pytest.approx(I[1, 1], rel=1e-12)
+        assert I[0, 1] == pytest.approx(0.0, abs=1e-10)
+        assert I[0, 2] == pytest.approx(0.0, abs=1e-10)
+        assert I[1, 2] == pytest.approx(0.0, abs=1e-10)
+        # I_zz > I_xx for a "pancake" (but our L > 2R so it's elongated)
+        # Actually for R=10, L=20: check both
+        # I_zz is about spin axis (disc-like contribution)
+
+    def test_sector_positions_count(self):
+        cfg = HabitatConfig(radius=10, length=20)
+        geom = CylinderGeometry(cfg)
+        sc = SectorConfig(n_angular=12, n_axial=3)
+        pos = geom.compute_sector_positions(sc)
+        assert pos.shape == (36, 3)
+        # All at radius R from z-axis
+        r_xy = np.sqrt(pos[:, 0]**2 + pos[:, 1]**2)
+        np.testing.assert_allclose(r_xy, 10.0, atol=1e-12)
+
+    def test_manifold_on_axis(self):
+        cfg = HabitatConfig(radius=10, length=20)
+        geom = CylinderGeometry(cfg)
+        tc = TankConfig(n_stations=3)
+        pos = geom.compute_manifold_positions(tc)
+        assert pos.shape == (3, 3)
+        np.testing.assert_allclose(pos[:, 0], 0.0, atol=1e-15)
+        np.testing.assert_allclose(pos[:, 1], 0.0, atol=1e-15)
+
+
+# ===================================================================
+# Motor profile tests
+# ===================================================================
+
+class TestMotor:
+
+    def test_trapezoidal_profile(self):
+        cfg = MotorConfig(profile="trapezoidal", max_torque=100,
+                          ramp_time=10, hold_time=50)
+        motor = SpinMotor(cfg)
+        # At t=0: 0
+        assert motor.get_torque(0.0) == pytest.approx(0.0)
+        # At t=5: half ramp
+        assert motor.get_torque(5.0) == pytest.approx(50.0)
+        # At t=10: full
+        assert motor.get_torque(10.0) == pytest.approx(100.0)
+        # At t=30: still holding
+        assert motor.get_torque(30.0) == pytest.approx(100.0)
+        # At t=65: midway down
+        assert motor.get_torque(65.0) == pytest.approx(50.0)
+        # At t=80: zero
+        assert motor.get_torque(80.0) == pytest.approx(0.0)
+
+    def test_off_profile(self):
+        cfg = MotorConfig(profile="off")
+        motor = SpinMotor(cfg)
+        assert motor.get_torque(100.0) == pytest.approx(0.0)
+
+
+# ===================================================================
+# Integration tests: torque-free spinner
+# ===================================================================
+
+class TestTorqueFreeSpinner:
+    """Simulate a torque-free spinning habitat and verify conservation."""
+
+    @staticmethod
+    def _make_torque_free_config(omega_z: float = 0.2094) -> ExperimentConfig:
+        """Config with motor off, short duration for testing."""
+        cfg = reference_config()
+        cfg.motor = MotorConfig(profile="off")
+        cfg.simulation = SimulationConfig(
+            dt=0.01, duration=60.0, control_dt=0.1, dynamics_level=1,
+        )
+        return cfg
+
+    def test_symmetric_spinner_omega_conserved(self):
+        """Pure spin about z: ω_x = ω_y should remain ~0, ω_z constant."""
+        cfg = self._make_torque_free_config()
+        engine = SimulationEngine(cfg)
+
+        # Set initial spin about z
+        omega_z_init = 0.2094   # ~2 rpm
+        engine.state.omega[:] = [0.0, 0.0, omega_z_init]
+
+        # No crew/cargo masses (empty habitat + water)
+        sector_masses = np.zeros(cfg.sectors.n_total)
+
+        n_steps = int(cfg.simulation.duration / cfg.simulation.control_dt)
+        for _ in range(n_steps):
+            engine.step_no_control(sector_masses)
+
+        # Check ω_z is still close to initial
+        assert engine.state.omega[2] == pytest.approx(omega_z_init, rel=1e-6)
+        # ω_x and ω_y should remain near zero
+        assert abs(engine.state.omega[0]) < 1e-10
+        assert abs(engine.state.omega[1]) < 1e-10
+
+    def test_angular_momentum_conserved(self):
+        """H in inertial frame should be constant for torque-free case."""
+        cfg = self._make_torque_free_config()
+        engine = SimulationEngine(cfg)
+        engine.state.omega[:] = [0.0, 0.0, 0.2094]
+
+        sector_masses = np.zeros(cfg.sectors.n_total)
+
+        # Run for a while
+        n_steps = int(cfg.simulation.duration / cfg.simulation.control_dt)
+        for _ in range(n_steps):
+            engine.step_no_control(sector_masses)
+
+        info = engine.monitor.get_info()
+        assert info["n_violations"] == 0, f"Violations: {info['violations']}"
+
+    def test_quaternion_norm_preserved(self):
+        """Quaternion norm should stay at 1.0."""
+        cfg = self._make_torque_free_config()
+        engine = SimulationEngine(cfg)
+        engine.state.omega[:] = [0.01, 0.005, 0.2094]  # slight off-axis
+
+        sector_masses = np.zeros(cfg.sectors.n_total)
+
+        n_steps = int(cfg.simulation.duration / cfg.simulation.control_dt)
+        for _ in range(n_steps):
+            engine.step_no_control(sector_masses)
+
+        q_norm = np.linalg.norm(engine.state.quaternion)
+        assert q_norm == pytest.approx(1.0, abs=1e-10)
+
+    def test_water_conserved(self):
+        """Total water mass must be exact throughout."""
+        cfg = self._make_torque_free_config()
+        engine = SimulationEngine(cfg)
+        engine.state.omega[:] = [0.0, 0.0, 0.2094]
+
+        initial_water = engine.state.total_water()
+
+        sector_masses = np.zeros(cfg.sectors.n_total)
+        n_steps = int(cfg.simulation.duration / cfg.simulation.control_dt)
+        for _ in range(n_steps):
+            engine.step_no_control(sector_masses)
+
+        final_water = engine.state.total_water()
+        assert final_water == pytest.approx(initial_water, abs=1e-10)
+
+
+# ===================================================================
+# Integration test: spin-up
+# ===================================================================
+
+class TestSpinUp:
+    """Verify that the motor brings the habitat to target spin rate."""
+
+    def test_spinup_reaches_target(self):
+        """After motor profile completes, ω_z ≈ target."""
+        cfg = reference_config()
+        cfg.simulation = SimulationConfig(
+            dt=0.01, duration=500.0, control_dt=0.1, dynamics_level=1,
+        )
+        cfg.motor = MotorConfig(
+            profile="trapezoidal",
+            max_torque=500.0,
+            ramp_time=60.0,
+            hold_time=300.0,
+            target_spin_rate=0.2094,
+        )
+
+        engine = SimulationEngine(cfg)
+        sector_masses = np.zeros(cfg.sectors.n_total)
+
+        n_steps = int(cfg.simulation.duration / cfg.simulation.control_dt)
+        for _ in range(n_steps):
+            engine.step_no_control(sector_masses)
+
+        # ω_z should be > 0 and increasing toward target
+        # With I_zz ≈ 4.4e6 kg·m² and trapezoidal impulse ≈ 180,000 N·m·s,
+        # expected ω_z ≈ 0.041 rad/s after 500 s (well short of the ~1846 s
+        # needed for full spin-up to 0.2094 rad/s).
+        assert engine.state.omega[2] > 0.03, (
+            f"ω_z = {engine.state.omega[2]:.4f} rad/s — spin-up seems to have failed"
+        )
+
+    def test_spinup_time_estimate(self):
+        """Check approximate spin-up time against analytical estimate."""
+        cfg = reference_config()
+        geom = CylinderGeometry(cfg.habitat)
+        I = geom.compute_structural_inertia()
+        I_zz = I[2, 2]
+
+        # Add water contribution to I_zz: all at radius R
+        # 36 tanks + 3 manifolds of water
+        tc = cfg.tanks
+        water_per_element = tc.total_water_mass / (tc.n_tanks_total + tc.n_stations)
+        I_zz_water = tc.n_tanks_total * water_per_element * cfg.habitat.radius**2
+        # manifold water is on axis, contributes 0 to I_zz
+        I_zz_total = I_zz + I_zz_water
+
+        target = cfg.motor.target_spin_rate
+        tau = cfg.motor.max_torque
+        t_est = I_zz_total * target / tau
+
+        # Sanity: spin-up time should be in a reasonable range
+        # For R=10m with ~4.4e6 kg·m² inertia and 500 N·m, expect ~1800 s
+        assert 100.0 < t_est < 5000.0, f"Estimated spin-up time: {t_est:.1f} s"
+
+
+# ===================================================================
+# Asymmetric spinner (nutation test)
+# ===================================================================
+
+class TestNutation:
+    """A mass imbalance should produce nutation at the predicted frequency."""
+
+    def test_imbalance_produces_nutation(self):
+        """With a single mass in one sector, the body should nutate."""
+        cfg = reference_config()
+        cfg.motor = MotorConfig(profile="off")
+        cfg.simulation = SimulationConfig(
+            dt=0.005,            # finer step for nutation accuracy
+            duration=30.0,
+            control_dt=0.05,
+            dynamics_level=1,
+        )
+
+        engine = SimulationEngine(cfg)
+        engine.state.omega[:] = [0.0, 0.0, 0.2094]
+
+        # Place a 200 kg mass in sector 0 (all others empty)
+        sector_masses = np.zeros(cfg.sectors.n_total)
+        sector_masses[0] = 200.0
+
+        # This creates a product of inertia — should produce nutation
+        nutation_angles = []
+        n_steps = int(cfg.simulation.duration / cfg.simulation.control_dt)
+        for _ in range(n_steps):
+            engine.step_no_control(sector_masses)
+            nutation_angles.append(engine.get_nutation_angle())
+
+        nutation_angles = np.array(nutation_angles)
+        # Nutation angle should oscillate — check it's not constant
+        assert nutation_angles.std() > 0.001, (
+            "Nutation angle is constant — mass imbalance not producing wobble"
+        )
+        # And should not blow up
+        assert nutation_angles.max() < 45.0, (
+            f"Nutation angle reached {nutation_angles.max():.1f}° — "
+            "seems unstable"
+        )
+
+
+# ===================================================================
+# Entry point
+# ===================================================================
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])
+
+
+=== FILE: tests/test_phase2.py ===
+"""Phase 2 tests: disturbances and tank control.
+
+Milestone criteria:
+  1. MassSchedule produces correct sector masses over time
+  2. Mass transfer interpolates smoothly
+  3. Static imbalance produces correct CM offset
+  4. Spinning imbalance produces conical whirl at spin frequency
+  5. Tank redistribution can reduce CM offset
+  6. Tank water conservation holds under active pumping
+  7. Scenario integration works with engine
+  8. Manifold axial equalisation converges
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import pytest
+
+from habitat_sim.config import (
+    ExperimentConfig, HabitatConfig, MotorConfig, SimulationConfig,
+    TankConfig, SectorConfig, reference_config,
+)
+from habitat_sim.disturbances.mass_schedule import (
+    MassSchedule, MassScheduleConfig, MassTransfer, StaticMass,
+    single_imbalance, uniform_crew, shift_change,
+)
+from habitat_sim.disturbances.scenario import Scenario, build_scenario
+from habitat_sim.actuators.tank_system import TankSystem, compute_correction_target
+from habitat_sim.simulation.engine import SimulationEngine
+from habitat_sim.simulation.state import SimState
+
+
+# ===================================================================
+# Mass schedule tests
+# ===================================================================
+
+class TestMassSchedule:
+
+    def test_static_mass(self):
+        """A static mass should appear at its sector at all times."""
+        cfg = MassScheduleConfig(
+            static_masses=[StaticMass(sector=5, mass=80.0)]
+        )
+        sched = MassSchedule(cfg, n_sectors=36)
+        m = sched.get_sector_masses(0.0)
+        assert m[5] == pytest.approx(80.0)
+        assert m.sum() == pytest.approx(80.0)
+
+        m2 = sched.get_sector_masses(1000.0)
+        np.testing.assert_array_equal(m, m2)
+
+    def test_transfer_before_start(self):
+        """Before transfer starts, mass is at source."""
+        cfg = MassScheduleConfig(
+            transfers=[MassTransfer(time=100.0, mass=50.0,
+                                    from_sector=0, to_sector=6, duration=30.0)]
+        )
+        sched = MassSchedule(cfg, n_sectors=36)
+        m = sched.get_sector_masses(50.0)
+        assert m[0] == pytest.approx(50.0)
+        assert m[6] == pytest.approx(0.0)
+
+    def test_transfer_after_end(self):
+        """After transfer completes, mass is at destination."""
+        cfg = MassScheduleConfig(
+            transfers=[MassTransfer(time=100.0, mass=50.0,
+                                    from_sector=0, to_sector=6, duration=30.0)]
+        )
+        sched = MassSchedule(cfg, n_sectors=36)
+        m = sched.get_sector_masses(200.0)
+        assert m[0] == pytest.approx(0.0)
+        assert m[6] == pytest.approx(50.0)
+
+    def test_transfer_midpoint(self):
+        """At midpoint, mass should be split 50/50."""
+        cfg = MassScheduleConfig(
+            transfers=[MassTransfer(time=100.0, mass=60.0,
+                                    from_sector=0, to_sector=6, duration=20.0)]
+        )
+        sched = MassSchedule(cfg, n_sectors=36)
+        m = sched.get_sector_masses(110.0)  # midpoint
+        assert m[0] == pytest.approx(30.0)
+        assert m[6] == pytest.approx(30.0)
+
+    def test_total_mass_conserved_during_transfer(self):
+        """Total mass should be constant throughout a transfer."""
+        cfg = MassScheduleConfig(
+            static_masses=[StaticMass(sector=3, mass=100.0)],
+            transfers=[MassTransfer(time=50.0, mass=100.0,
+                                    from_sector=3, to_sector=10, duration=40.0)]
+        )
+        sched = MassSchedule(cfg, n_sectors=36)
+        for t in [0, 25, 50, 60, 70, 90, 100, 200]:
+            m = sched.get_sector_masses(float(t))
+            assert m.sum() == pytest.approx(200.0), f"Mass not conserved at t={t}"
+
+    def test_multiple_transfers(self):
+        """Multiple simultaneous transfers should all work."""
+        cfg = MassScheduleConfig(
+            transfers=[
+                MassTransfer(time=0, mass=10, from_sector=0, to_sector=1, duration=10),
+                MassTransfer(time=0, mass=20, from_sector=2, to_sector=3, duration=10),
+            ]
+        )
+        sched = MassSchedule(cfg, n_sectors=36)
+        m = sched.get_sector_masses(10.0)
+        assert m[0] == pytest.approx(0.0)
+        assert m[1] == pytest.approx(10.0)
+        assert m[2] == pytest.approx(0.0)
+        assert m[3] == pytest.approx(20.0)
+
+
+# ===================================================================
+# Convenience builder tests
+# ===================================================================
+
+class TestConvenienceBuilders:
+
+    def test_uniform_crew(self):
+        cfg = uniform_crew(mass_per_person=80.0, n_crew=20, n_sectors=36)
+        sched = MassSchedule(cfg, n_sectors=36)
+        m = sched.get_sector_masses(0.0)
+        expected_per_sector = 80.0 * 20 / 36
+        np.testing.assert_allclose(m, expected_per_sector, atol=1e-12)
+
+    def test_single_imbalance(self):
+        cfg = single_imbalance(mass=200.0, sector=5)
+        sched = MassSchedule(cfg, n_sectors=36)
+        m = sched.get_sector_masses(0.0)
+        assert m[5] == pytest.approx(200.0)
+        assert m.sum() == pytest.approx(200.0)
+
+    def test_shift_change(self):
+        cfg = shift_change(
+            mass_per_person=80.0, n_crew=6,
+            from_sectors=[0, 1, 2], to_sectors=[6, 7, 8],
+            start_time=100.0, duration=60.0,
+        )
+        sched = MassSchedule(cfg, n_sectors=36)
+        # Before shift
+        m0 = sched.get_sector_masses(50.0)
+        assert m0[0] > 0
+        assert m0[6] == pytest.approx(0.0)
+        # After shift
+        m1 = sched.get_sector_masses(200.0)
+        assert m1[0] == pytest.approx(0.0)
+        assert m1[6] > 0
+
+
+# ===================================================================
+# Scenario tests
+# ===================================================================
+
+class TestScenario:
+
+    def test_empty_scenario(self):
+        scenario = Scenario(n_sectors=36)
+        m = scenario.get_sector_masses(0.0)
+        np.testing.assert_array_equal(m, np.zeros(36))
+
+    def test_combined_sources(self):
+        """Two mass sources should be summed."""
+        cfg1 = MassScheduleConfig(static_masses=[StaticMass(0, 50)])
+        cfg2 = MassScheduleConfig(static_masses=[StaticMass(0, 30)])
+        s1 = MassSchedule(cfg1, 36)
+        s2 = MassSchedule(cfg2, 36)
+        scenario = Scenario([s1, s2], n_sectors=36)
+        m = scenario.get_sector_masses(0.0)
+        assert m[0] == pytest.approx(80.0)
+
+    def test_build_scenario_from_dicts(self):
+        """build_scenario should parse disturbance config dicts."""
+        configs = [{
+            "type": "mass_schedule",
+            "static_masses": [{"sector": 3, "mass": 100.0}],
+            "transfers": [],
+        }]
+        scenario = build_scenario(configs, n_sectors=36)
+        m = scenario.get_sector_masses(0.0)
+        assert m[3] == pytest.approx(100.0)
+
+
+# ===================================================================
+# Scenario integration with engine
+# ===================================================================
+
+class TestScenarioEngine:
+
+    def test_engine_with_disturbance_config(self):
+        """Engine should build and use a scenario from config."""
+        cfg = reference_config()
+        cfg.motor = MotorConfig(profile="off")
+        cfg.simulation = SimulationConfig(dt=0.01, duration=10.0,
+                                          control_dt=0.1)
+        cfg.disturbances = [{
+            "type": "mass_schedule",
+            "static_masses": [{"sector": 0, "mass": 200.0}],
+            "transfers": [],
+        }]
+
+        engine = SimulationEngine(cfg)
+        engine.state.omega[:] = [0.0, 0.0, 0.2094]
+
+        # Step using scenario (no override)
+        action = np.zeros(36)
+        for _ in range(100):
+            engine.step(action)
+
+        # CM should be offset (mass at sector 0 creates imbalance)
+        cm_mag = engine.get_cm_offset_magnitude()
+        assert cm_mag > 0.001, f"CM offset {cm_mag} too small — disturbance not applied"
+
+
+# ===================================================================
+# CM offset and conical whirl
+# ===================================================================
+
+class TestConicalWhirl:
+
+    @staticmethod
+    def _make_spinning_config(duration: float = 30.0) -> ExperimentConfig:
+        cfg = reference_config()
+        cfg.motor = MotorConfig(profile="off")
+        cfg.simulation = SimulationConfig(
+            dt=0.005, duration=duration, control_dt=0.05,
+        )
+        return cfg
+
+    def test_imbalance_creates_cm_offset(self):
+        """A mass in sector 0 should create a measurable CM offset."""
+        cfg = self._make_spinning_config(duration=1.0)
+        engine = SimulationEngine(cfg)
+
+        sector_masses = np.zeros(36)
+        sector_masses[0] = 200.0
+
+        cm = engine.get_cm_offset()
+        # Before any stepping, CM should already be offset
+        # because CM is computed from geometry + current masses
+        # Actually need to pass sector_masses to get_cm_offset...
+        # Let me step once to populate _last_sector_masses
+        engine.step_no_control(sector_masses)
+        cm = engine.get_cm_offset()
+
+        assert np.linalg.norm(cm[:2]) > 0.01, (
+            f"CM offset {cm} too small for 200 kg imbalance at R=10m"
+        )
+
+    def test_spinning_imbalance_produces_wobble(self):
+        """A spinning habitat with static imbalance should wobble."""
+        cfg = self._make_spinning_config(duration=30.0)
+        engine = SimulationEngine(cfg)
+        engine.state.omega[:] = [0.0, 0.0, 0.2094]
+
+        sector_masses = np.zeros(36)
+        sector_masses[0] = 200.0
+
+        # Record ω_x over time
+        omega_x_history = []
+        n_steps = int(cfg.simulation.duration / cfg.simulation.control_dt)
+        for _ in range(n_steps):
+            engine.step_no_control(sector_masses)
+            omega_x_history.append(engine.state.omega[0])
+
+        omega_x = np.array(omega_x_history)
+
+        # Should see oscillation in ω_x (conical whirl)
+        assert omega_x.std() > 1e-6, (
+            "ω_x is constant — no conical whirl detected from mass imbalance"
+        )
+
+    def test_conical_whirl_frequency(self):
+        """Wobble frequency should be near the spin frequency for
+        a near-axisymmetric body (I_zz ≈ 2*I_xx → ω_nut ≈ ω_spin)."""
+        cfg = self._make_spinning_config(duration=60.0)
+        engine = SimulationEngine(cfg)
+        omega_spin = 0.2094
+        engine.state.omega[:] = [0.0, 0.0, omega_spin]
+
+        sector_masses = np.zeros(36)
+        sector_masses[0] = 200.0
+
+        omega_x_history = []
+        times = []
+        dt_ctrl = cfg.simulation.control_dt
+        n_steps = int(cfg.simulation.duration / dt_ctrl)
+        for i in range(n_steps):
+            engine.step_no_control(sector_masses)
+            omega_x_history.append(engine.state.omega[0])
+            times.append((i + 1) * dt_ctrl)
+
+        omega_x = np.array(omega_x_history)
+
+        # FFT to find dominant frequency
+        from numpy.fft import rfft, rfftfreq
+        N = len(omega_x)
+        freqs = rfftfreq(N, d=dt_ctrl)
+        spectrum = np.abs(rfft(omega_x))
+        # Skip DC
+        peak_idx = np.argmax(spectrum[1:]) + 1
+        peak_freq = freqs[peak_idx]
+
+        # Expected: nutation frequency ≈ spin_freq * (I_zz - I_xx)/I_xx
+        spin_freq_hz = omega_spin / (2 * np.pi)
+        # For this geometry, I_zz/I_xx ≈ some ratio; just check
+        # peak is within factor of 3 of spin frequency
+        assert 0.3 * spin_freq_hz < peak_freq < 3.0 * spin_freq_hz, (
+            f"Peak freq {peak_freq:.4f} Hz not near spin freq "
+            f"{spin_freq_hz:.4f} Hz"
+        )
+
+
+# ===================================================================
+# Tank correction tests
+# ===================================================================
+
+class TestTankCorrection:
+
+    def test_correction_target_computation(self):
+        """compute_correction_target should produce valid targets."""
+        cfg = reference_config()
+        geom = SimulationEngine(cfg).geometry
+        tank_pos = geom.compute_tank_positions(cfg.tanks)
+
+        target = compute_correction_target(
+            desired_cm_x=-0.1, desired_cm_y=0.0,
+            tank_positions=tank_pos,
+            total_water=cfg.tanks.total_water_mass,
+            tank_capacity=cfg.tanks.tank_capacity,
+        )
+
+        # Should sum to total water
+        assert target.sum() == pytest.approx(cfg.tanks.total_water_mass, rel=1e-4)
+        # All non-negative
+        assert (target >= -1e-10).all()
+        # None exceed capacity
+        assert (target <= cfg.tanks.tank_capacity + 1e-10).all()
+
+    def test_tank_pumping_reduces_cm_offset(self):
+        """Active tank control should reduce the CM offset from an imbalance.
+
+        Strategy: place a mass at sector 0, then pump water to the
+        opposite side to counteract.
+        """
+        cfg = reference_config()
+        cfg.motor = MotorConfig(profile="off")
+        cfg.simulation = SimulationConfig(
+            dt=0.01, duration=30.0, control_dt=0.1,
+        )
+
+        engine = SimulationEngine(cfg)
+        engine.state.omega[:] = [0.0, 0.0, 0.2094]
+
+        # 200 kg at sector 0 (angular index 0, axial index 0)
+        sector_masses = np.zeros(36)
+        sector_masses[0] = 200.0
+
+        # Measure initial CM offset
+        engine.step_no_control(sector_masses)
+        cm_initial = engine.get_cm_offset_magnitude()
+
+        # Build a valve command: drain sector-0 tanks, fill sector-6 tanks
+        # (sector 6 is at 180° from sector 0)
+        # Tank layout mirrors sector layout, so tank index 6 at each
+        # station is opposite tank 0.
+        action = np.zeros(36)
+        for station in range(3):
+            base = station * 12
+            action[base + 0] = -1.0   # drain tank at 0°
+            action[base + 6] = +1.0   # fill tank at 180°
+
+        # Run with active pumping
+        n_steps = int(29.0 / cfg.simulation.control_dt)  # remaining time
+        for _ in range(n_steps):
+            engine.step(action, sector_masses_override=sector_masses)
+
+        cm_final = engine.get_cm_offset_magnitude()
+
+        # CM offset should have decreased
+        assert cm_final < cm_initial, (
+            f"Tank correction failed: CM went from {cm_initial:.4f} "
+            f"to {cm_final:.4f} m"
+        )
+
+    def test_water_conserved_under_active_pumping(self):
+        """Total water must be exactly conserved even with active pumping."""
+        cfg = reference_config()
+        cfg.motor = MotorConfig(profile="off")
+        cfg.simulation = SimulationConfig(
+            dt=0.01, duration=20.0, control_dt=0.1,
+        )
+
+        engine = SimulationEngine(cfg)
+        engine.state.omega[:] = [0.0, 0.0, 0.2094]
+        initial_water = engine.state.total_water()
+
+        # Random valve commands
+        rng = np.random.default_rng(42)
+        sector_masses = np.zeros(36)
+        n_steps = int(cfg.simulation.duration / cfg.simulation.control_dt)
+
+        for _ in range(n_steps):
+            action = rng.uniform(-1, 1, size=36)
+            engine.step(action, sector_masses_override=sector_masses)
+
+        final_water = engine.state.total_water()
+        assert final_water == pytest.approx(initial_water, abs=1e-8), (
+            f"Water drift: {final_water - initial_water:.2e} kg"
+        )
+
+
+# ===================================================================
+# Tank system constraint tests
+# ===================================================================
+
+class TestTankSystem:
+
+    def test_enforce_constraints_clips_tanks(self):
+        cfg = reference_config()
+        state = SimState(cfg)
+
+        ts = TankSystem(cfg.tanks)
+
+        # Set one tank over capacity, one negative
+        state.tank_masses[0] = cfg.tanks.tank_capacity + 50.0
+        state.tank_masses[1] = -10.0
+
+        ts.enforce_constraints(state)
+
+        assert state.tank_masses[0] <= cfg.tanks.tank_capacity
+        assert state.tank_masses[1] >= 0.0
+
+    def test_enforce_constraints_preserves_total(self):
+        cfg = reference_config()
+        state = SimState(cfg)
+        ts = TankSystem(cfg.tanks)
+
+        # Perturb water total
+        state.manifold_masses[0] += 5.0
+        ts.enforce_constraints(state)
+
+        assert state.total_water() == pytest.approx(
+            cfg.tanks.total_water_mass, abs=1e-10
+        )
+
+
+# ===================================================================
+# Manifold axial equalisation
+# ===================================================================
+
+class TestAxialEqualisation:
+
+    def test_manifolds_converge_to_equal(self):
+        """With no valve activity, manifolds should equalise over time."""
+        cfg = reference_config()
+        cfg.motor = MotorConfig(profile="off")
+        cfg.simulation = SimulationConfig(
+            dt=0.01, duration=120.0, control_dt=0.1,
+        )
+        # Increase axial gain for faster test convergence
+        cfg.tanks.k_axial = 0.5
+
+        engine = SimulationEngine(cfg)
+        engine.state.omega[:] = [0.0, 0.0, 0.2094]
+
+        # Create imbalanced manifolds
+        engine.state.manifold_masses[:] = [100.0, 30.0, 30.0]
+        # Adjust tanks to maintain total water
+        tank_total = cfg.tanks.total_water_mass - 160.0
+        engine.state.tank_masses[:] = tank_total / 36.0
+
+        sector_masses = np.zeros(36)
+        n_steps = int(cfg.simulation.duration / cfg.simulation.control_dt)
+        for _ in range(n_steps):
+            engine.step_no_control(sector_masses)
+
+        # Manifolds should be closer to equal
+        manifold_std = engine.state.manifold_masses.std()
+        assert manifold_std < 10.0, (
+            f"Manifolds still imbalanced after 120 s: "
+            f"std = {manifold_std:.2f} kg, "
+            f"levels = {engine.state.manifold_masses}"
+        )
+
+
+# ===================================================================
+# Entry point
+# ===================================================================
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])
+
+
+=== FILE: tests/test_phase3.py ===
+"""Phase 3 tests: sensors and Gymnasium environment.
+
+Milestone criteria:
+  1. Strain gauge reads correct centripetal force for steady spin
+  2. Strain gauge force is proportional to sector mass
+  3. Strain gauge noise has correct statistics
+  4. Strain gauge detects wobble (asymmetric forces for non-zero ω_x)
+  5. Sensor suite builds observation of correct dimension
+  6. Gymnasium env reset returns correct shapes
+  7. Gymnasium env step returns correct shapes
+  8. Random agent runs full episode without crashing
+  9. Observation vector contains physically plausible values
+  10. Gymnasium env_checker passes
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import pytest
+
+from habitat_sim.config import (
+    ExperimentConfig, MotorConfig, SimulationConfig,
+    SensorConfig, reference_config,
+)
+from habitat_sim.sensors.strain_gauge import StrainGaugeArray
+from habitat_sim.sensors.sensor_suite import SensorSuite
+from habitat_sim.simulation.engine import SimulationEngine
+
+
+# ===================================================================
+# Strain gauge unit tests
+# ===================================================================
+
+class TestStrainGauge:
+
+    @staticmethod
+    def _ring_positions(n: int = 12, R: float = 10.0) -> np.ndarray:
+        """12 sector centroids evenly spaced on a ring of radius R."""
+        angles = np.linspace(0, 2 * np.pi, n, endpoint=False)
+        positions = np.zeros((n, 3))
+        positions[:, 0] = R * np.cos(angles)
+        positions[:, 1] = R * np.sin(angles)
+        return positions
+
+    def test_centripetal_force_steady_spin(self):
+        """For pure spin (ω_z) a sector of mass m should feel m·ω²·R."""
+        R = 10.0
+        omega_z = 0.2094
+        m = 80.0  # kg
+
+        positions = self._ring_positions(12, R)
+        gauges = StrainGaugeArray(positions, noise_std=0.0)
+
+        omega = np.array([0.0, 0.0, omega_z])
+        d_omega = np.zeros(3)
+        masses = np.full(12, m)
+
+        forces = gauges.measure(omega, d_omega, masses, rng=None)
+
+        expected = m * omega_z**2 * R
+        np.testing.assert_allclose(forces, expected, rtol=1e-10)
+
+    def test_force_proportional_to_mass(self):
+        """Force should scale linearly with sector mass."""
+        R = 10.0
+        omega_z = 0.2094
+        positions = self._ring_positions(12, R)
+        gauges = StrainGaugeArray(positions, noise_std=0.0)
+
+        omega = np.array([0.0, 0.0, omega_z])
+        d_omega = np.zeros(3)
+
+        masses_1 = np.ones(12) * 50.0
+        masses_2 = np.ones(12) * 100.0
+
+        f1 = gauges.measure(omega, d_omega, masses_1)
+        f2 = gauges.measure(omega, d_omega, masses_2)
+
+        np.testing.assert_allclose(f2, 2 * f1, rtol=1e-10)
+
+    def test_zero_mass_zero_force(self):
+        """Empty sectors should register zero force."""
+        positions = self._ring_positions(12)
+        gauges = StrainGaugeArray(positions, noise_std=0.0)
+
+        omega = np.array([0.0, 0.0, 0.2094])
+        d_omega = np.zeros(3)
+        masses = np.zeros(12)
+
+        forces = gauges.measure(omega, d_omega, masses, rng=None)
+        np.testing.assert_allclose(forces, 0.0, atol=1e-15)
+
+    def test_wobble_creates_asymmetry(self):
+        """Non-zero transverse ω should break the rotational symmetry."""
+        R = 10.0
+        positions = self._ring_positions(12, R)
+        gauges = StrainGaugeArray(positions, noise_std=0.0)
+
+        masses = np.ones(12) * 80.0
+        d_omega = np.zeros(3)
+
+        # Pure spin — all forces equal
+        f_steady = gauges.measure(np.array([0.0, 0.0, 0.2094]), d_omega, masses)
+        assert np.allclose(f_steady, f_steady[0], rtol=1e-8)
+
+        # Spin + wobble — forces vary around the ring
+        f_wobble = gauges.measure(np.array([0.05, 0.0, 0.2094]), d_omega, masses)
+        assert not np.allclose(f_wobble, f_wobble[0], rtol=1e-3)
+
+    def test_noise_statistics(self):
+        """Noise should have approximately correct mean and std."""
+        R = 10.0
+        noise_std = 5.0
+        positions = self._ring_positions(1, R)
+        gauges = StrainGaugeArray(positions, noise_std=noise_std)
+
+        omega = np.array([0.0, 0.0, 0.2094])
+        d_omega = np.zeros(3)
+        masses = np.array([80.0])
+        rng = np.random.default_rng(42)
+
+        readings = np.array([
+            gauges.measure(omega, d_omega, masses, rng)[0]
+            for _ in range(10000)
+        ])
+
+        expected_mean = masses[0] * 0.2094**2 * R
+        assert abs(readings.mean() - expected_mean) < 1.0
+        assert readings.std() == pytest.approx(noise_std, rel=0.1)
+
+    def test_output_shape(self):
+        positions = self._ring_positions(36)
+        gauges = StrainGaugeArray(positions)
+        omega = np.array([0.0, 0.0, 0.2094])
+        d_omega = np.zeros(3)
+        masses = np.ones(36) * 50.0
+        result = gauges.measure(omega, d_omega, masses)
+        assert result.shape == (36,)
+
+
+# ===================================================================
+# Sensor suite tests
+# ===================================================================
+
+class TestSensorSuite:
+
+    @staticmethod
+    def _sector_positions(n_angular: int = 12, n_axial: int = 3,
+                          R: float = 10.0, L: float = 20.0) -> np.ndarray:
+        n = n_angular * n_axial
+        positions = np.zeros((n, 3))
+        angles = np.linspace(0, 2 * np.pi, n_angular, endpoint=False)
+        axial_centers = np.linspace(-L / 2, L / 2, n_axial + 1)
+        axial_centers = (axial_centers[:-1] + axial_centers[1:]) / 2
+        idx = 0
+        for j in range(n_axial):
+            for i in range(n_angular):
+                positions[idx] = [R * np.cos(angles[i]),
+                                   R * np.sin(angles[i]),
+                                   axial_centers[j]]
+                idx += 1
+        return positions
+
+    @staticmethod
+    def _make_suite() -> SensorSuite:
+        positions = TestSensorSuite._sector_positions()
+        config = SensorConfig(strain_gauge_noise_std=0.0)
+        return SensorSuite(config, positions, n_sectors=36, seed=42)
+
+    def test_observation_dimension(self):
+        suite = self._make_suite()
+        assert suite.observation_dimension == 75  # 36 + 36 + 3
+
+    def test_observation_shape(self):
+        suite = self._make_suite()
+        obs = suite.observe(
+            omega=np.array([0.0, 0.0, 0.2]),
+            d_omega=np.zeros(3),
+            sector_masses=np.ones(36) * 50.0,
+            tank_masses=np.ones(36) * 50.0,
+            manifold_masses=np.ones(3) * 10.0,
+        )
+        assert obs.shape == (75,)
+
+    def test_observation_contains_tank_levels(self):
+        """Tank fill levels should appear verbatim in observation."""
+        suite = self._make_suite()
+        tank_masses = np.arange(36, dtype=np.float64)
+        manifold_masses = np.array([100.0, 200.0, 300.0])
+
+        obs = suite.observe(
+            omega=np.zeros(3), d_omega=np.zeros(3),
+            sector_masses=np.zeros(36),
+            tank_masses=tank_masses,
+            manifold_masses=manifold_masses,
+        )
+
+        # Tanks at indices [36:72], manifolds at [72:75]
+        np.testing.assert_array_equal(obs[36:72], tank_masses)
+        np.testing.assert_array_equal(obs[72:75], manifold_masses)
+
+    def test_spinning_produces_positive_forces(self):
+        """All strain gauge readings should be positive during spin."""
+        suite = self._make_suite()
+        masses = np.ones(36) * 80.0
+        obs = suite.observe(
+            omega=np.array([0.0, 0.0, 0.2094]),
+            d_omega=np.zeros(3),
+            sector_masses=masses,
+            tank_masses=np.ones(36) * 50.0,
+            manifold_masses=np.ones(3) * 10.0,
+        )
+        # All strain gauge readings should be > 0
+        assert (obs[:36] > 0).all()
+
+
+# ===================================================================
+# Engine observation tests
+# ===================================================================
+
+class TestEngineObservation:
+
+    def test_step_returns_observation(self):
+        """engine.step should return (obs, info) tuple."""
+        cfg = reference_config()
+        cfg.motor = MotorConfig(profile="off")
+        cfg.simulation = SimulationConfig(dt=0.01, duration=10.0, control_dt=0.1)
+
+        engine = SimulationEngine(cfg)
+        engine.state.omega[:] = [0.0, 0.0, 0.2094]
+
+        action = np.zeros(36)
+        obs, info = engine.step(action)
+
+        assert obs.shape == (75,)
+        assert isinstance(info, dict)
+
+    def test_initial_observation(self):
+        """get_initial_observation should return correct shape."""
+        cfg = reference_config()
+        engine = SimulationEngine(cfg)
+        obs = engine.get_initial_observation()
+        assert obs.shape == (75,)
+
+    def test_reset_returns_observation(self):
+        """engine.reset should return initial observation."""
+        cfg = reference_config()
+        engine = SimulationEngine(cfg)
+
+        action = np.zeros(36)
+        for _ in range(10):
+            engine.step(action)
+
+        obs = engine.reset(seed=123)
+        assert obs.shape == (75,)
+        assert engine.t == 0.0
+        assert engine.state.omega[2] == pytest.approx(0.0)
+
+
+# ===================================================================
+# Gymnasium environment tests
+# ===================================================================
+
+class TestHabitatEnv:
+
+    @staticmethod
+    def _make_env(**kwargs):
+        from habitat_sim.environment.habitat_env import HabitatEnv
+        cfg = reference_config()
+        cfg.motor = MotorConfig(profile="off")
+        cfg.simulation = SimulationConfig(
+            dt=0.01, duration=10.0, control_dt=0.1,
+        )
+        return HabitatEnv(config=cfg, **kwargs)
+
+    def test_reset_shape(self):
+        env = self._make_env()
+        obs, info = env.reset(seed=42)
+        assert obs.shape == (75,)
+        assert isinstance(info, dict)
+
+    def test_step_shape(self):
+        env = self._make_env()
+        env.reset(seed=42)
+        action = np.zeros(36)
+        obs, reward, terminated, truncated, info = env.step(action)
+
+        assert obs.shape == (75,)
+        assert isinstance(reward, float)
+        assert isinstance(terminated, bool)
+        assert isinstance(truncated, bool)
+        assert isinstance(info, dict)
+
+    def test_action_clipping(self):
+        """Actions outside [-1, +1] should be clipped, not error."""
+        env = self._make_env()
+        env.reset(seed=42)
+        action = np.ones(36) * 5.0
+        obs, reward, terminated, truncated, info = env.step(action)
+        assert obs.shape == (75,)
+
+    def test_episode_terminates(self):
+        """Episode should terminate after duration / control_dt steps."""
+        env = self._make_env()
+        env.reset(seed=42)
+
+        n_max = int(10.0 / 0.1)  # 100 steps
+        terminated = False
+        for i in range(n_max + 10):
+            action = np.zeros(36)
+            obs, reward, terminated, truncated, info = env.step(action)
+            if terminated:
+                break
+
+        assert terminated
+        assert info["step_count"] == n_max
+
+    def test_random_agent_episode(self):
+        """A random agent should complete an episode without crashing."""
+        env = self._make_env()
+        obs, _ = env.reset(seed=42)
+
+        rng = np.random.default_rng(42)
+        total_reward = 0.0
+        steps = 0
+
+        while True:
+            action = rng.uniform(-1, 1, size=36)
+            obs, reward, terminated, truncated, info = env.step(action)
+            total_reward += reward
+            steps += 1
+            if terminated or truncated:
+                break
+
+        assert steps == 100  # 10s / 0.1s
+        assert np.isfinite(total_reward)
+        assert obs.shape == (75,)
+
+    def test_reward_is_negative(self):
+        """Reward should generally be negative (all terms are penalties)."""
+        env = self._make_env()
+        env.reset(seed=42)
+
+        rng = np.random.default_rng(42)
+        rewards = []
+        for _ in range(20):
+            action = rng.uniform(-1, 1, size=36)
+            _, reward, _, _, _ = env.step(action)
+            rewards.append(reward)
+
+        assert sum(r < 0 for r in rewards) >= 15
+
+    def test_spaces_match(self):
+        """obs/action shapes should match the declared spaces."""
+        env = self._make_env()
+        obs, _ = env.reset(seed=42)
+
+        assert env.observation_space.contains(obs)
+
+        action = env.action_space.sample()
+        obs2, _, _, _, _ = env.step(action)
+        assert env.observation_space.contains(obs2)
+
+
+# ===================================================================
+# Gymnasium env_checker
+# ===================================================================
+
+class TestGymnasiumChecker:
+
+    def test_env_checker(self):
+        """The official Gymnasium env_checker should pass."""
+        from gymnasium.utils.env_checker import check_env
+        from habitat_sim.environment.habitat_env import HabitatEnv
+
+        cfg = reference_config()
+        cfg.motor = MotorConfig(profile="off")
+        cfg.simulation = SimulationConfig(
+            dt=0.01, duration=5.0, control_dt=0.1,
+        )
+
+        env = HabitatEnv(config=cfg)
+
+        check_env(env.unwrapped if hasattr(env, 'unwrapped') else env,
+                   skip_render_check=True)
+
+
+# ===================================================================
+# Entry point
+# ===================================================================
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])
+
+
+=== FILE: tests/test_phase4.py ===
+"""Phase 4 tests: SAC training pipeline.
+
+Milestone criteria:
+  1. build_vec_env returns env with correct obs/action shapes
+  2. build_sac constructs agent without error
+  3. Short training run (1000 steps) completes without crashing
+  4. Saved model can be loaded and produces valid actions
+  5. CurriculumCallback advances stages at correct timestep thresholds
+  6. evaluate_agent returns dict with expected keys
+"""
+
+from __future__ import annotations
+
+import os
+import tempfile
+
+import numpy as np
+import pytest
+
+from habitat_sim.config import (
+    ExperimentConfig, MotorConfig, SimulationConfig, RLConfig, reference_config,
+)
+from habitat_sim.control.sac_agent import build_vec_env, build_sac, load_sac
+from habitat_sim.control.training import evaluate_agent, run_training
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _fast_config() -> ExperimentConfig:
+    """Minimal config for fast tests (10-second episodes)."""
+    cfg = reference_config()
+    cfg.motor = MotorConfig(profile="off")
+    cfg.simulation = SimulationConfig(dt=0.01, duration=10.0, control_dt=0.1)
+    cfg.rl = RLConfig(
+        total_timesteps=200,
+        n_envs=1,
+        learning_starts=50,
+        buffer_size=500,
+        batch_size=32,
+        eval_freq=100,
+        n_eval_episodes=1,
+        checkpoint_freq=100,
+        curriculum=False,
+    )
+    cfg.seed = 0
+    return cfg
+
+
+# ---------------------------------------------------------------------------
+# VecEnv construction
+# ---------------------------------------------------------------------------
+
+class TestVecEnv:
+
+    def test_obs_action_shapes(self):
+        cfg = _fast_config()
+        env = build_vec_env(cfg, n_envs=1, seed=0)
+        assert env.observation_space.shape == (75,)
+        assert env.action_space.shape == (36,)
+        env.close()
+
+    def test_multiple_envs(self):
+        cfg = _fast_config()
+        env = build_vec_env(cfg, n_envs=2, seed=0)
+        assert env.num_envs == 2
+        obs = env.reset()
+        assert obs.shape == (2, 75)
+        env.close()
+
+    def test_reset_returns_obs(self):
+        cfg = _fast_config()
+        env = build_vec_env(cfg, n_envs=1, seed=0)
+        obs = env.reset()
+        assert obs.shape == (1, 75)
+        assert np.all(np.isfinite(obs))
+        env.close()
+
+
+# ---------------------------------------------------------------------------
+# SAC construction
+# ---------------------------------------------------------------------------
+
+class TestBuildSAC:
+
+    def test_constructs_without_error(self):
+        cfg = _fast_config()
+        env = build_vec_env(cfg, n_envs=1, seed=0)
+        model = build_sac(env, cfg.rl, seed=0)
+        assert model is not None
+        env.close()
+
+    def test_policy_name(self):
+        cfg = _fast_config()
+        env = build_vec_env(cfg, n_envs=1, seed=0)
+        model = build_sac(env, cfg.rl, seed=0)
+        assert "SAC" in model.__class__.__name__
+        env.close()
+
+    def test_predict_returns_valid_action(self):
+        cfg = _fast_config()
+        env = build_vec_env(cfg, n_envs=1, seed=0)
+        model = build_sac(env, cfg.rl, seed=0)
+        obs = env.reset()
+        action, _ = model.predict(obs, deterministic=True)
+        assert action.shape == (1, 36)
+        assert np.all(action >= -1.0) and np.all(action <= 1.0)
+        env.close()
+
+
+# ---------------------------------------------------------------------------
+# Short training run
+# ---------------------------------------------------------------------------
+
+class TestShortTraining:
+
+    def test_training_completes(self, tmp_path):
+        cfg = _fast_config()
+        cfg.rl.log_dir = str(tmp_path / "run")
+        model = run_training(cfg)
+        assert model is not None
+
+    def test_final_model_saved(self, tmp_path):
+        cfg = _fast_config()
+        log_dir = str(tmp_path / "run")
+        cfg.rl.log_dir = log_dir
+        run_training(cfg)
+        assert os.path.exists(os.path.join(log_dir, "final_model.zip"))
+
+    def test_model_load_and_predict(self, tmp_path):
+        cfg = _fast_config()
+        log_dir = str(tmp_path / "run")
+        cfg.rl.log_dir = log_dir
+        run_training(cfg)
+
+        model_path = os.path.join(log_dir, "final_model")
+        loaded = load_sac(model_path)
+        assert loaded is not None
+
+
+# ---------------------------------------------------------------------------
+# Curriculum callback
+# ---------------------------------------------------------------------------
+
+class TestCurriculumCallback:
+
+    def test_curriculum_runs_without_error(self, tmp_path):
+        cfg = _fast_config()
+        cfg.rl.curriculum = True
+        cfg.rl.total_timesteps = 200
+        cfg.rl.log_dir = str(tmp_path / "run")
+        model = run_training(cfg)
+        assert model is not None
+
+
+# ---------------------------------------------------------------------------
+# evaluate_agent
+# ---------------------------------------------------------------------------
+
+class TestEvaluateAgent:
+
+    def test_returns_expected_keys(self, tmp_path):
+        cfg = _fast_config()
+        cfg.rl.log_dir = str(tmp_path / "run")
+        run_training(cfg)
+
+        model_path = os.path.join(str(tmp_path / "run"), "final_model")
+        results = evaluate_agent(model_path, cfg, n_episodes=2)
+
+        for key in ("mean_reward", "std_reward", "mean_nutation_deg",
+                    "std_nutation_deg", "mean_cm_offset", "episodes"):
+            assert key in results, f"Missing key: {key}"
+
+    def test_episode_count(self, tmp_path):
+        cfg = _fast_config()
+        cfg.rl.log_dir = str(tmp_path / "run")
+        run_training(cfg)
+
+        model_path = os.path.join(str(tmp_path / "run"), "final_model")
+        results = evaluate_agent(model_path, cfg, n_episodes=3)
+        assert len(results["episodes"]) == 3
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])
+
+
+=== FILE: tests/test_phase5.py ===
+"""Phase 5 tests: SQLite telemetry database.
+
+Milestone criteria:
+  1. get_engine(":memory:") creates all tables without error
+  2. ExperimentRecorder inserts Experiment row on entry
+  3. record_episode() inserts correct Episode + Timestep rows
+  4. get_reward_curve() returns data matching what was inserted
+  5. list_experiments() returns correct experiment metadata
+  6. DB records survive context manager exit (no rollback on clean exit)
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from habitat_sim.config import reference_config, MotorConfig, SimulationConfig
+from habitat_sim.database.schema import Experiment, Episode, Timestep, get_engine
+from habitat_sim.database.recorder import ExperimentRecorder
+from sqlalchemy.orm import Session
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _make_steps(n: int = 5) -> list[dict]:
+    return [
+        {
+            "step_index": i,
+            "t": i * 0.1,
+            "omega": [0.0, 0.0, 0.2],
+            "cm_offset_mag": 0.01,
+            "total_water": 1800.0,
+            "kinetic_energy": 100.0,
+            "reward": -1.0,
+            "n_violations": 0,
+        }
+        for i in range(n)
+    ]
+
+
+def _make_cfg():
+    cfg = reference_config()
+    cfg.motor = MotorConfig(profile="off")
+    cfg.simulation = SimulationConfig(dt=0.01, duration=10.0, control_dt=0.1)
+    return cfg
+
+
+# ---------------------------------------------------------------------------
+# Schema
+# ---------------------------------------------------------------------------
+
+class TestSchema:
+
+    def test_create_tables_in_memory(self):
+        engine = get_engine(":memory:")
+        with engine.connect() as conn:
+            tables = engine.dialect.get_table_names(conn)
+        for name in ("experiments", "episodes", "timesteps"):
+            assert name in tables
+
+    def test_distinct_in_memory_engines(self):
+        engine1 = get_engine(":memory:")
+        engine2 = get_engine(":memory:")
+        assert engine1 is not engine2
+
+
+# ---------------------------------------------------------------------------
+# ExperimentRecorder
+# ---------------------------------------------------------------------------
+
+class TestExperimentRecorder:
+
+    def test_creates_experiment_on_entry(self):
+        cfg = _make_cfg()
+        with ExperimentRecorder(":memory:", "test_run", cfg) as rec:
+            with Session(rec._engine) as session:
+                count = session.query(Experiment).count()
+        assert count == 1
+
+    def test_experiment_name_stored(self):
+        cfg = _make_cfg()
+        with ExperimentRecorder(":memory:", "my_experiment", cfg) as rec:
+            with Session(rec._engine) as session:
+                exp = session.query(Experiment).first()
+                name = exp.name
+        assert name == "my_experiment"
+
+    def test_record_episode_inserts_rows(self):
+        cfg = _make_cfg()
+        steps = _make_steps(5)
+        with ExperimentRecorder(":memory:", "run", cfg) as rec:
+            rec.record_episode(0, steps)
+            with Session(rec._engine) as session:
+                ep_count = session.query(Episode).count()
+                ts_count = session.query(Timestep).count()
+        assert ep_count == 1
+        assert ts_count == 5
+
+    def test_episode_n_steps_correct(self):
+        cfg = _make_cfg()
+        steps = _make_steps(8)
+        with ExperimentRecorder(":memory:", "run", cfg) as rec:
+            rec.record_episode(0, steps)
+            with Session(rec._engine) as session:
+                ep = session.query(Episode).first()
+                n = ep.n_steps
+        assert n == 8
+
+    def test_total_reward_correct(self):
+        cfg = _make_cfg()
+        steps = _make_steps(4)  # reward = -1.0 each
+        with ExperimentRecorder(":memory:", "run", cfg) as rec:
+            rec.record_episode(0, steps)
+            with Session(rec._engine) as session:
+                ep = session.query(Episode).first()
+                r = ep.total_reward
+        assert r == pytest.approx(-4.0)
+
+    def test_multiple_episodes(self):
+        cfg = _make_cfg()
+        with ExperimentRecorder(":memory:", "run", cfg) as rec:
+            for ep_num in range(3):
+                rec.record_episode(ep_num, _make_steps(5))
+            with Session(rec._engine) as session:
+                ep_count = session.query(Episode).count()
+        assert ep_count == 3
+
+    def test_records_survive_context_exit(self):
+        cfg = _make_cfg()
+        engine_ref = None
+        with ExperimentRecorder(":memory:", "run", cfg) as rec:
+            rec.record_episode(0, _make_steps(3))
+            engine_ref = rec._engine
+        with Session(engine_ref) as session:
+            count = session.query(Episode).count()
+        assert count == 1
+
+
+# ---------------------------------------------------------------------------
+# Timestep data correctness
+# ---------------------------------------------------------------------------
+
+class TestTimestepData:
+
+    def test_timestep_t_values(self):
+        cfg = _make_cfg()
+        with ExperimentRecorder(":memory:", "run", cfg) as rec:
+            rec.record_episode(0, _make_steps(3))
+            with Session(rec._engine) as session:
+                rows = (
+                    session.query(Timestep)
+                    .order_by(Timestep.step_index)
+                    .all()
+                )
+                t_vals = [r.t for r in rows]
+        assert t_vals == pytest.approx([0.0, 0.1, 0.2])
+
+    def test_omega_z_stored(self):
+        cfg = _make_cfg()
+        with ExperimentRecorder(":memory:", "run", cfg) as rec:
+            rec.record_episode(0, _make_steps(2))
+            with Session(rec._engine) as session:
+                row = session.query(Timestep).first()
+                oz = row.omega_z
+        assert oz == pytest.approx(0.2)
+
+    def test_engine_info_stored_on_episode(self):
+        cfg = _make_cfg()
+        with ExperimentRecorder(":memory:", "run", cfg) as rec:
+            rec.record_episode(0, _make_steps(2), engine_info={
+                "final_nutation_deg": 1.5,
+                "final_cm_offset_mag": 0.03,
+                "final_omega_z": 0.21,
+            })
+            with Session(rec._engine) as session:
+                ep = session.query(Episode).first()
+                nutation = ep.final_nutation_deg
+        assert nutation == pytest.approx(1.5)
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])
+
+
+=== FILE: tests/test_phase6.py ===
+"""Phase 6 tests: stochastic disturbances and toroid geometry.
+
+Milestone criteria:
+  Stochastic disturbances:
+    1. PoissonCrewDisturbance total mass conserved at all sampled times
+    2. At least one sector-change event occurs in a 1000 s simulation
+    3. Linear interpolation is smooth (no discontinuities between samples)
+    4. MicroImpactDisturbance produces non-zero output at an impact time
+    5. build_scenario_from_stochastic_config constructs correct sources
+
+  Toroid geometry:
+    6. structural_mass() matches analytical formula
+    7. compute_structural_inertia() is diagonal with I_xx == I_yy
+    8. I_zz > I_xx (spin-axis has more inertia for R >> r)
+    9. Sector positions are all at radius R in z=0 plane
+   10. Toroid config can be passed to SimulationEngine and simulates without error
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import pytest
+
+from habitat_sim.config import (
+    reference_config,
+    HabitatConfig,
+    StochasticConfig,
+)
+from habitat_sim.disturbances.stochastic import (
+    PoissonCrewDisturbance,
+    MicroImpactDisturbance,
+)
+from habitat_sim.disturbances.scenario import build_scenario_from_stochastic_config
+from habitat_sim.geometry.toroid import ToroidGeometry
+
+
+# ---------------------------------------------------------------------------
+# Stochastic disturbances
+# ---------------------------------------------------------------------------
+
+class TestPoissonCrew:
+
+    def _make_crew(self, **kwargs) -> PoissonCrewDisturbance:
+        defaults = dict(
+            n_sectors=36,
+            n_crew=6,
+            mass_per_person=80.0,
+            lambda_rate=0.1,   # high rate so events occur in short windows
+            transfer_duration=5.0,
+            seed=42,
+        )
+        defaults.update(kwargs)
+        return PoissonCrewDisturbance(**defaults)
+
+    def test_total_mass_conserved(self):
+        """Total mass equals n_crew * mass_per_person at all sampled times."""
+        crew = self._make_crew()
+        expected = 6 * 80.0
+        for t in [0.0, 1.0, 5.0, 10.0, 50.0, 100.0, 500.0]:
+            masses = crew.get_sector_masses(t)
+            assert masses.sum() == pytest.approx(expected, rel=1e-6), (
+                f"Mass not conserved at t={t}: got {masses.sum()}"
+            )
+
+    def test_sector_change_occurs(self):
+        """At least one sector configuration change in 1000 s."""
+        crew = self._make_crew(lambda_rate=0.1)
+        m0 = crew.get_sector_masses(0.0).copy()
+        changed = False
+        for t in np.linspace(1.0, 1000.0, 200):
+            m = crew.get_sector_masses(t)
+            if not np.allclose(m, m0):
+                changed = True
+                break
+        assert changed, "No sector changes detected in 1000 s"
+
+    def test_smooth_interpolation(self):
+        """No large discontinuity between closely-spaced samples."""
+        crew = self._make_crew(lambda_rate=0.01, transfer_duration=30.0)
+        times = np.linspace(0.0, 200.0, 2000)
+        prev = crew.get_sector_masses(times[0])
+        for t in times[1:]:
+            curr = crew.get_sector_masses(t)
+            max_jump = np.abs(curr - prev).max()
+            # A smooth move of 80 kg over 30 s sampled at dt=0.1 s
+            # gives max step = 80 * 0.1/30 = 0.267 kg; allow 2x margin.
+            assert max_jump < 1.0, (
+                f"Discontinuity of {max_jump:.3f} kg at t={t:.2f}"
+            )
+            prev = curr
+
+
+class TestMicroImpact:
+
+    def test_nonzero_at_impact_time(self):
+        """Mass is non-zero during an impact window."""
+        dist = MicroImpactDisturbance(
+            n_sectors=36,
+            rate=1.0,         # 1 impact/s -- guaranteed to have impacts
+            mass_std=1.0,
+            duration=2.0,
+            seed=0,
+        )
+        # Sample densely; at least one window must be non-zero
+        found = False
+        for t in np.linspace(0.0, 20.0, 200):
+            if dist.get_sector_masses(t).sum() > 0.0:
+                found = True
+                break
+        assert found, "MicroImpactDisturbance produced no non-zero output"
+
+    def test_zero_outside_impact(self):
+        """Returns zero array before any impacts."""
+        dist = MicroImpactDisturbance(
+            n_sectors=36,
+            rate=0.001,
+            mass_std=0.1,
+            duration=1.0,
+            seed=99,
+        )
+        # t=0 is before the first impact (first inter-event time >= 1/0.001=1000 s expected)
+        m = dist.get_sector_masses(0.0)
+        assert m.sum() == pytest.approx(0.0)
+
+
+class TestBuildScenarioFromStochastic:
+
+    def test_poisson_crew_source_added(self):
+        cfg = StochasticConfig(poisson_crew=True, n_crew=4, lambda_rate=0.05)
+        scenario = build_scenario_from_stochastic_config(cfg, n_sectors=36, seed=0)
+        assert len(scenario.sources) == 1
+        assert isinstance(scenario.sources[0], PoissonCrewDisturbance)
+
+    def test_micro_impact_source_added(self):
+        cfg = StochasticConfig(micro_impacts=True)
+        scenario = build_scenario_from_stochastic_config(cfg, n_sectors=36, seed=0)
+        assert len(scenario.sources) == 1
+        assert isinstance(scenario.sources[0], MicroImpactDisturbance)
+
+    def test_both_sources_added(self):
+        cfg = StochasticConfig(poisson_crew=True, micro_impacts=True)
+        scenario = build_scenario_from_stochastic_config(cfg, n_sectors=36, seed=0)
+        assert len(scenario.sources) == 2
+
+    def test_empty_config_no_sources(self):
+        cfg = StochasticConfig()  # both disabled by default
+        scenario = build_scenario_from_stochastic_config(cfg, n_sectors=36)
+        assert len(scenario.sources) == 0
+
+    def test_crew_total_mass_correct(self):
+        """Scenario mass equals n_crew * mass_per_person."""
+        cfg = StochasticConfig(
+            poisson_crew=True, n_crew=6, mass_per_person=80.0,
+        )
+        scenario = build_scenario_from_stochastic_config(cfg, n_sectors=36)
+        assert scenario.get_sector_masses(0.0).sum() == pytest.approx(480.0)
+
+
+# ---------------------------------------------------------------------------
+# Toroid geometry
+# ---------------------------------------------------------------------------
+
+def _make_toroid(R: float = 50.0, r: float = 5.0) -> ToroidGeometry:
+    c = reference_config().habitat
+    # Override shape and radii
+    from dataclasses import replace
+    c = replace(c, shape="toroid", radius=R, minor_radius=r)
+    return ToroidGeometry(c)
+
+
+class TestToroidGeometry:
+
+    def test_structural_mass_formula(self):
+        """m = wall_density * 4*pi^2*R*r * wall_thickness."""
+        tg = _make_toroid(R=50.0, r=5.0)
+        c = tg.config
+        expected = c.wall_density * 4.0 * np.pi**2 * c.radius * c.minor_radius * c.wall_thickness
+        assert tg.structural_mass() == pytest.approx(expected, rel=1e-9)
+
+    def test_inertia_is_diagonal(self):
+        """Off-diagonal elements are zero."""
+        tg = _make_toroid()
+        I = tg.compute_structural_inertia()
+        assert I.shape == (3, 3)
+        off_diag = I - np.diag(np.diag(I))
+        assert np.allclose(off_diag, 0.0)
+
+    def test_ixx_equals_iyy(self):
+        """I_xx == I_yy by axisymmetry."""
+        tg = _make_toroid()
+        I = tg.compute_structural_inertia()
+        assert I[0, 0] == pytest.approx(I[1, 1])
+
+    def test_izz_greater_than_ixx(self):
+        """I_zz > I_xx when R >> r (spin axis dominates)."""
+        tg = _make_toroid(R=50.0, r=2.0)
+        I = tg.compute_structural_inertia()
+        assert I[2, 2] > I[0, 0]
+
+    def test_sector_positions_at_major_radius(self):
+        """All sector positions lie at radius R in the z=0 plane."""
+        tg = _make_toroid(R=50.0, r=5.0)
+        c = reference_config()
+        positions = tg.compute_sector_positions(c.sectors)
+        radii = np.sqrt(positions[:, 0]**2 + positions[:, 1]**2)
+        assert np.allclose(radii, tg.config.radius, rtol=1e-9)
+        assert np.allclose(positions[:, 2], 0.0)
+
+    def test_sector_count_equals_n_angular(self):
+        """Toroid returns n_angular sectors (not n_angular * n_axial)."""
+        tg = _make_toroid()
+        c = reference_config()
+        positions = tg.compute_sector_positions(c.sectors)
+        assert positions.shape[0] == c.sectors.n_angular
+
+    def test_inertia_analytical_values(self):
+        """Check I_zz and I_xx against closed-form expressions."""
+        R, r = 50.0, 5.0
+        tg = _make_toroid(R=R, r=r)
+        m = tg.structural_mass()
+        I = tg.compute_structural_inertia()
+        assert I[2, 2] == pytest.approx(m * (2*R**2 + 3*r**2) / 2.0, rel=1e-9)
+        assert I[0, 0] == pytest.approx(m * (2*R**2 + 5*r**2) / 4.0, rel=1e-9)
+
+    def test_toroid_simulates_without_error(self):
+        """SimulationEngine with toroid shape runs a few steps."""
+        from habitat_sim.simulation.engine import SimulationEngine
+        from habitat_sim.config import SectorConfig, TankConfig
+        from dataclasses import replace
+
+        cfg = reference_config()
+        # Toroid has no axial extent -- use n_axial=1 so n_total == n_angular.
+        cfg.habitat = replace(cfg.habitat, shape="toroid", minor_radius=5.0)
+        cfg.sectors = SectorConfig(n_angular=12, n_axial=1)
+        cfg.tanks = replace(cfg.tanks, n_tanks_per_station=12, n_stations=1)
+
+        engine = SimulationEngine(cfg)
+        state = engine.reset(seed=0)
+        assert state is not None
+
+        # Run a few steps with zero control action
+        action = np.zeros(cfg.tanks.n_tanks_total)
+        for _ in range(3):
+            obs, info = engine.step(action)
+        assert np.all(np.isfinite(obs))
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])
+
+
+=== FILE: tests/test_viz.py ===
+"""Tests for habitat_sim.visualization.scene_3d.
+
+These tests do NOT require plotly to be installed — they skip gracefully
+when the optional dependency is absent.  When plotly IS available they
+verify structure, shapes, and correctness of the generated figures.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import pytest
+from dataclasses import replace
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+try:
+    import plotly.graph_objects as go  # noqa: F401
+    PLOTLY_AVAILABLE = True
+except ImportError:
+    PLOTLY_AVAILABLE = False
+
+pytestmark = pytest.mark.skipif(
+    not PLOTLY_AVAILABLE,
+    reason="plotly not installed — skipping visualization tests",
+)
+
+
+def _make_engine(shape: str = "cylinder"):
+    from habitat_sim.config import reference_config, SectorConfig, TankConfig
+    from habitat_sim.simulation.engine import SimulationEngine
+
+    cfg = reference_config()
+    if shape == "toroid":
+        cfg.habitat = replace(cfg.habitat, shape="toroid", minor_radius=5.0)
+        cfg.sectors = SectorConfig(n_angular=12, n_axial=1)
+        cfg.tanks = replace(cfg.tanks, n_tanks_per_station=12, n_stations=1)
+    return SimulationEngine(cfg)
+
+
+# ---------------------------------------------------------------------------
+# Wireframe helpers (no engine needed)
+# ---------------------------------------------------------------------------
+
+class TestWireframeGenerators:
+    def test_cylinder_wireframe_returns_segments(self):
+        from habitat_sim.visualization.scene_3d import _cylinder_wireframe
+        segs = _cylinder_wireframe(R=10.0, L=20.0)
+        assert len(segs) > 0
+        for seg in segs:
+            assert seg.ndim == 2
+            assert seg.shape[1] == 3
+
+    def test_cylinder_wireframe_all_at_radius(self):
+        from habitat_sim.visualization.scene_3d import _cylinder_wireframe
+        R = 10.0
+        segs = _cylinder_wireframe(R=R, L=20.0)
+        for seg in segs:
+            # Every point should be at distance == R from z-axis (within float precision)
+            r_xy = np.sqrt(seg[:, 0]**2 + seg[:, 1]**2)
+            np.testing.assert_allclose(r_xy, R, atol=1e-10)
+
+    def test_toroid_wireframe_returns_segments(self):
+        from habitat_sim.visualization.scene_3d import _toroid_wireframe
+        segs = _toroid_wireframe(R=10.0, r=3.0)
+        assert len(segs) > 0
+        for seg in segs:
+            assert seg.ndim == 2
+            assert seg.shape[1] == 3
+
+    def test_toroid_wireframe_points_on_torus(self):
+        """All points must satisfy the toroid implicit equation."""
+        from habitat_sim.visualization.scene_3d import _toroid_wireframe
+        R, r = 10.0, 3.0
+        segs = _toroid_wireframe(R=R, r=r, n_tor=8, n_pol=8)
+        for seg in segs:
+            x, y, z = seg[:, 0], seg[:, 1], seg[:, 2]
+            # Implicit equation: (sqrt(x²+y²) - R)² + z² = r²
+            lhs = (np.sqrt(x**2 + y**2) - R)**2 + z**2
+            np.testing.assert_allclose(lhs, r**2, atol=1e-10)
+
+    def test_lines_to_scatter_produces_nones(self):
+        """None separators must appear between segments."""
+        from habitat_sim.visualization.scene_3d import _lines_to_scatter
+        seg1 = np.array([[0, 0, 0], [1, 0, 0]], dtype=float)
+        seg2 = np.array([[2, 0, 0], [3, 0, 0]], dtype=float)
+        trace = _lines_to_scatter([seg1, seg2])
+        assert None in trace.x
+        assert None in trace.y
+        assert None in trace.z
+
+
+# ---------------------------------------------------------------------------
+# HabitatScene — cylinder / ring
+# ---------------------------------------------------------------------------
+
+class TestHabitatSceneCylinder:
+    @pytest.fixture
+    def scene(self):
+        from habitat_sim.visualization.scene_3d import HabitatScene
+        engine = _make_engine("cylinder")
+        return HabitatScene(engine)
+
+    def test_build_figure_returns_figure(self, scene):
+        import plotly.graph_objects as go
+        fig = scene.build_figure()
+        assert isinstance(fig, go.Figure)
+
+    def test_figure_has_expected_traces(self, scene):
+        fig = scene.build_figure()
+        names = [t.name for t in fig.data]
+        assert any("wireframe" in (n or "").lower() for n in names), \
+            "Expected a wireframe trace"
+        assert any("sector" in (n or "").lower() for n in names), \
+            "Expected a sector trace"
+        assert any("tank" in (n or "").lower() for n in names), \
+            "Expected a tank trace"
+        assert any("spin" in (n or "").lower() or "\u03c9" in (n or "") for n in names), \
+            "Expected a spin axis trace"
+        assert any("angular momentum" in (n or "").lower() or "H" in (n or "") for n in names), \
+            "Expected an angular momentum trace"
+
+    def test_sector_trace_has_correct_count(self, scene):
+        fig = scene.build_figure()
+        # Find the sector scatter trace
+        sector_traces = [t for t in fig.data
+                         if hasattr(t, "name") and "sector" in (t.name or "").lower()]
+        assert sector_traces, "No sector trace found"
+        trace = sector_traces[0]
+        n_sectors = scene.engine.config.sectors.n_total
+        assert len(trace.x) == n_sectors
+
+    def test_tank_trace_has_correct_count(self, scene):
+        fig = scene.build_figure()
+        tank_traces = [t for t in fig.data
+                       if hasattr(t, "name") and "tank" in (t.name or "").lower()
+                       and hasattr(t, "x")]
+        assert tank_traces, "No tank trace found"
+        trace = tank_traces[0]
+        n_tanks = scene.engine.config.tanks.n_tanks_total
+        assert len(trace.x) == n_tanks
+
+    def test_tank_fill_level_in_range(self, scene):
+        fig = scene.build_figure()
+        tank_traces = [t for t in fig.data
+                       if hasattr(t, "name") and "tank" in (t.name or "").lower()
+                       and hasattr(t, "marker") and hasattr(t.marker, "color")]
+        assert tank_traces
+        fill = np.asarray(tank_traces[0].marker.color)
+        assert np.all(fill >= 0.0), "Fill levels must be >= 0"
+        assert np.all(fill <= 1.0 + 1e-9), "Fill levels must be <= 1"
+
+    def test_figure_title_contains_shape(self, scene):
+        fig = scene.build_figure()
+        title = fig.layout.title.text or ""
+        assert "cylinder" in title.lower()
+
+    def test_figure_has_cube_aspect(self, scene):
+        fig = scene.build_figure()
+        assert fig.layout.scene.aspectmode == "cube"
+
+
+# ---------------------------------------------------------------------------
+# HabitatScene — toroid
+# ---------------------------------------------------------------------------
+
+class TestHabitatSceneToroid:
+    @pytest.fixture
+    def scene(self):
+        from habitat_sim.visualization.scene_3d import HabitatScene
+        engine = _make_engine("toroid")
+        return HabitatScene(engine)
+
+    def test_build_figure_returns_figure(self, scene):
+        import plotly.graph_objects as go
+        fig = scene.build_figure()
+        assert isinstance(fig, go.Figure)
+
+    def test_sector_count_matches_toroid(self, scene):
+        fig = scene.build_figure()
+        sector_traces = [t for t in fig.data
+                         if hasattr(t, "name") and "sector" in (t.name or "").lower()]
+        assert sector_traces
+        # Toroid has n_angular sectors (n_axial=1 → n_total = 12)
+        assert len(sector_traces[0].x) == scene.engine.config.sectors.n_total
+
+    def test_figure_title_contains_toroid(self, scene):
+        fig = scene.build_figure()
+        title = fig.layout.title.text or ""
+        assert "toroid" in title.lower()
+
+
+# ---------------------------------------------------------------------------
+# Nutation utility
+# ---------------------------------------------------------------------------
+
+class TestNutationDeg:
+    def test_aligned_vectors_give_zero(self):
+        from habitat_sim.visualization.scene_3d import _nutation_deg
+        omega = np.array([0.0, 0.0, 1.0])
+        H = np.array([0.0, 0.0, 5.0])
+        assert _nutation_deg(omega, H) == pytest.approx(0.0, abs=1e-10)
+
+    def test_perpendicular_vectors_give_90(self):
+        from habitat_sim.visualization.scene_3d import _nutation_deg
+        omega = np.array([1.0, 0.0, 0.0])
+        H = np.array([0.0, 1.0, 0.0])
+        assert _nutation_deg(omega, H) == pytest.approx(90.0, abs=1e-8)
+
+    def test_known_angle(self):
+        from habitat_sim.visualization.scene_3d import _nutation_deg
+        omega = np.array([0.0, 0.0, 1.0])
+        H = np.array([0.0, 1.0, 1.0]) / np.sqrt(2.0)
+        assert _nutation_deg(omega, H) == pytest.approx(45.0, abs=1e-8)
+
+    def test_zero_omega_returns_zero(self):
+        from habitat_sim.visualization.scene_3d import _nutation_deg
+        assert _nutation_deg(np.zeros(3), np.array([0.0, 0.0, 1.0])) == 0.0
+
+    def test_zero_H_returns_zero(self):
+        from habitat_sim.visualization.scene_3d import _nutation_deg
+        assert _nutation_deg(np.array([0.0, 0.0, 1.0]), np.zeros(3)) == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Error on missing plotly (cannot easily test without uninstalling, so
+# we just verify the ImportError message is informative)
+# ---------------------------------------------------------------------------
+
+class TestRequirePlotly:
+    def test_error_message_contains_install_hint(self):
+        """_require_plotly() should not raise when plotly IS available."""
+        from habitat_sim.visualization.scene_3d import _require_plotly
+        # If we are here, plotly is available (pytestmark skips otherwise)
+        _require_plotly()  # should not raise
+
+

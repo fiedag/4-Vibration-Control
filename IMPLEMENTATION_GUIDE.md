@@ -15,7 +15,7 @@ Phases 1–3 must already be present and passing (71 tests). The existing codeba
 - `habitat_sim/geometry/` — `CylinderGeometry`, `RingGeometry`
 - `habitat_sim/simulation/` — `SimulationEngine`, `SimState`, `ConservationMonitor`
 - `habitat_sim/environment/` — `HabitatEnv` (Gymnasium-compatible)
-- `habitat_sim/sensors/` — `SensorSuite`, `AccelerometerArray`, `MassTracker`
+- `habitat_sim/sensors/` — `SensorSuite`, `StrainGaugeArray`
 - `habitat_sim/disturbances/` — `MassSchedule`, `Scenario`, `build_scenario()`
 - `habitat_sim/config.py` — all configuration dataclasses
 - `pyproject.toml` — build system and extras
@@ -652,13 +652,12 @@ Replace hardcoded slices in `check()`:
 Add `n_tanks` and `n_manifolds` parameters to `SensorSuite.__init__`:
 
 ```python
-def __init__(self, config, accelerometer_positions, n_sectors=36,
+def __init__(self, config, sector_positions, n_sectors=36,
              n_tanks=36, n_manifolds=3, seed=42):
     ...
     self.n_tanks = n_tanks
     self.n_manifolds = n_manifolds
-    self.n_accel_obs = 3 * self.n_accels
-    self.n_obs = self.n_accel_obs + n_sectors + n_tanks + n_manifolds
+    self.n_obs = n_sectors + n_tanks + n_manifolds
 ```
 
 Replace hardcoded `36` and `3` in `observe()`:
@@ -680,10 +679,10 @@ self.monitor = ConservationMonitor(
     n_manifolds=config.tanks.n_stations,
 )
 
-# Add n_tanks and n_manifolds to SensorSuite:
+# Pass sector_positions directly (no accelerometer positions needed):
 self.sensors = SensorSuite(
     config=config.sensors,
-    accelerometer_positions=accel_positions,
+    sector_positions=self.sector_positions,
     n_sectors=config.sectors.n_total,
     n_tanks=config.tanks.n_tanks_total,
     n_manifolds=config.tanks.n_stations,
@@ -702,13 +701,12 @@ self.sensors = SensorSuite(
 The `SimulationEngine` requires that positions and masses arrays have matching lengths. For a toroid:
 - `n_axial=1` makes `sectors.n_total = n_angular` (matches the geometry's sector positions)
 - `n_stations=1` makes `tanks.n_tanks_total = n_tanks_per_station` (matches tank positions)
-- `n_accelerometers=2` matches the toroid's 2-accelerometer placement
+- Strain gauges scale automatically — one per sector, so no sensor count config needed
 
 ```python
 cfg.habitat = replace(cfg.habitat, shape="toroid", minor_radius=5.0)
 cfg.sectors = SectorConfig(n_angular=12, n_axial=1)
 cfg.tanks = replace(cfg.tanks, n_tanks_per_station=12, n_stations=1)
-cfg.sensors = replace(cfg.sensors, n_accelerometers=2)
 ```
 
 `engine.step(action)` returns `(obs, info)`, not a plain observation array.
@@ -766,7 +764,6 @@ cfg = reference_config()
 cfg.habitat = replace(cfg.habitat, shape="toroid", minor_radius=5.0)
 cfg.sectors = SectorConfig(n_angular=12, n_axial=1)
 cfg.tanks = replace(cfg.tanks, n_tanks_per_station=12, n_stations=1)
-cfg.sensors = replace(cfg.sensors, n_accelerometers=2)
 
 engine = SimulationEngine(cfg)
 obs = engine.reset(seed=0)

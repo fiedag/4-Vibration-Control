@@ -23,10 +23,10 @@ To design physical experiments validating the SAC-trained vibration control mode
 - **Motor Spin-Up**: Ramp rotation from 0 to target speed during episode to test stability under acceleration.
 
 ### 5. **Sensors Selection and Integration**
-- **Angular Velocity (Gyro)**: High-precision 6-axis IMU (e.g., MPU-6050 or better) at geometric center for ω_x, ω_y, ω_z; sample at 100-200Hz.
-- **Acceleration**: Same IMU for accelerometer data (simulating habitat sensors).
-- **Mass Trackers**: Strain gauges or load cells under each of 36 tanks for water mass measurement; noisy readings to match sim.
-- **Additional**: Encoder on motor shaft for spin rate (ω_z); optical sensors for position if needed.
+- **Strain Gauges (Primary Control Sensor)**: One strain gauge embedded in the floor of each of the 36 sectors, measuring compressive normal force from the mass above. This matches the simulation sensor model exactly — the control agent observes force readings, not accelerations. Sample at 100 Hz; noise level tunable to match `strain_gauge_noise_std` in config.
+- **Angular Velocity (State Estimation / Safety)**: High-precision 6-axis IMU (e.g., MPU-6050 or better) at geometric centre for ω_x, ω_y, ω_z; sample at 100–200 Hz. Used for state monitoring and safety limits, not as a direct RL observation.
+- **Motor Encoder**: On motor shaft for spin rate (ω_z) ground truth.
+- **Optional**: Optical or capacitive sensors for tank fill levels if direct measurement is needed for validation.
 
 ### 6. **Actuators Implementation**
 - **Water Tanks**: 36 syringes or small pumps (20-50mL capacity each, scaled from 100kg sim) arranged in rim; manifolds for redistribution.

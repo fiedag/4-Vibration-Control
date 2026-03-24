@@ -9,7 +9,7 @@ The Rotating Space Habitat Simulation is a Python-based framework for modeling t
 - **Physics Simulation**: Rigid body dynamics with quaternion-based orientation tracking, inertia tensor computation, and RK4 integration.
 - **Disturbances**: Prescribed or stochastic crew/cargo movements, micro-impacts, and mass imbalances.
 - **Control System**: 36 rim water tanks connected via manifolds for mass redistribution, controlled by a Soft Actor-Critic (SAC) RL agent.
-- **Sensors**: 6 three-axis accelerometers and noisy mass trackers for state observation.
+- **Sensors**: 36 strain gauges — one per sector floor — measuring compressive normal force from crew/cargo mass, encoding both occupancy and nutation state.
 - **RL Training**: Integration with Stable Baselines3 for training and evaluation.
 - **Database Logging**: SQLite-based storage of experiments, episodes, and timesteps for analysis.
 - **CLI Tools**: Command-line interfaces for training, simulation, and analysis.
@@ -29,7 +29,7 @@ The simulation is built around a modular architecture:
 - **Geometry**: Habitat shapes (cylinder, ring, toroid) with structural inertia.
 - **Dynamics**: Rigid body equations with variable inertia.
 - **Actuators**: Tank system with hybrid manifolds.
-- **Sensors**: Accelerometer and mass tracker models.
+- **Sensors**: Strain gauge array (floor force sensors, one per sector).
 - **Disturbances**: Mass schedules and stochastic events.
 - **Environment**: Gymnasium-compatible RL environment.
 - **Control**: SAC agent and training pipeline.
@@ -162,7 +162,7 @@ cfg = reference_config()
 - **SectorConfig**: Angular and axial sector grid (n_angular=12, n_axial=3).
 - **TankConfig**: Tank count, capacity, flow rates.
 - **MotorConfig**: Spin motor torque profiles.
-- **SensorConfig**: Accelerometer count and noise.
+- **SensorConfig**: Strain gauge noise level (`strain_gauge_noise_std`, N per gauge).
 - **SimulationConfig**: Timesteps, durations.
 - **RLConfig**: SAC hyperparameters, curriculum.
 - **StochasticConfig**: Poisson crew and micro-impacts.
@@ -200,7 +200,6 @@ cfg = reference_config()
 cfg.habitat = replace(cfg.habitat, shape="toroid", minor_radius=5.0)
 cfg.sectors = SectorConfig(n_angular=12, n_axial=1)
 cfg.tanks = replace(cfg.tanks, n_tanks_per_station=12, n_stations=1)
-cfg.sensors = replace(cfg.sensors, n_accelerometers=2)
 ```
 
 ## Running Simulations and Demos

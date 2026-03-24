@@ -20,12 +20,11 @@ A set of water tanks distributed around the habitat rim, connected via manifolds
 
 ### Control algorithm
 
-**SAC (Soft Actor-Critic)** operating on a standard **MLP (Multi-Layer Perceptron)** with two hidden layers of 256 units. The agent observes accelerometer readings and mass estimates, and outputs continuous valve commands.
+**SAC (Soft Actor-Critic)** operating on a standard **MLP (Multi-Layer Perceptron)** with two hidden layers of 256 units. The agent observes strain gauge floor forces and tank/manifold fill levels, and outputs continuous valve commands.
 
 ### Sensors
 
-- **6 three-axis accelerometers** (2 per axial station, opposed at 0° and 180°) — capture centripetal acceleration and vibration signatures
-- **Mass tracker** — noisy, rate-limited estimates of crew/cargo mass in each of the 36 habitat sectors
+- **36 strain gauges** — one embedded in the floor of each habitat sector, measuring the compressive normal force from crew/cargo mass above. Force readings encode both the sector occupancy and the current nutation state (wobble creates a sinusoidal variation in force around the ring).
 
 ### Complexity levels
 
@@ -127,8 +126,7 @@ habitat_sim/
 │   ├── motor.py           Spin motor with torque profiles
 │   └── tank_system.py     Rim tanks + manifolds
 ├── sensors/
-│   ├── accelerometer.py   3-axis accelerometer model
-│   ├── mass_tracker.py    Noisy sector mass estimator
+│   ├── strain_gauge.py    Floor force sensor model (one per sector)
 │   └── sensor_suite.py    Bundles sensors → observation vector
 ├── disturbances/
 │   ├── mass_schedule.py   Prescribed crew/cargo movement
@@ -160,14 +158,14 @@ habitat_sim/
 | Quantity | Default value |
 |---|---|
 | State dimension (Level 1) | 46 (quaternion 4 + omega 3 + tanks 36 + manifolds 3) |
-| Observation dimension | 93 (accel 18 + sectors 36 + tanks 36 + manifolds 3) |
+| Observation dimension | 75 (strain gauges 36 + tanks 36 + manifolds 3) |
 | Action dimension | 36 (valve commands) |
 | Physics timestep | 0.01 s (100 Hz) |
 | Control timestep | 0.1 s (10 Hz) |
 | Sectors | 12 angular × 3 axial = 36 |
 | Rim tanks | 12 per station × 3 stations = 36 |
 | Manifolds | 3 (one per axial station) |
-| Accelerometers | 6 (2 per station, opposed) |
+| Strain gauges | 36 (one per sector floor) |
 | SAC network | [256, 256] MLP, ReLU |
 | Curriculum stages | 4 (0 → 50 → 150 → 200 kg imbalance) |
 
@@ -195,7 +193,7 @@ print(cfg.to_json())              # serialise to JSON string
 | `SectorConfig` | `n_angular × n_axial` sector grid |
 | `TankConfig` | Tank count, capacity, water mass, flow rates |
 | `MotorConfig` | Spin motor torque profile |
-| `SensorConfig` | Accelerometer count and noise levels |
+| `SensorConfig` | Strain gauge noise level |
 | `SimulationConfig` | `dt`, `control_dt`, episode duration |
 | `RLConfig` | SAC hyperparameters, curriculum toggle |
 | `StochasticConfig` | Poisson crew and micro-impact disturbances |
@@ -305,7 +303,6 @@ cfg = reference_config()
 cfg.habitat = replace(cfg.habitat, shape="toroid", minor_radius=5.0)
 cfg.sectors = SectorConfig(n_angular=12, n_axial=1)   # no axial extent
 cfg.tanks = replace(cfg.tanks, n_tanks_per_station=12, n_stations=1)
-cfg.sensors = replace(cfg.sensors, n_accelerometers=2)
 
 engine = SimulationEngine(cfg)
 obs = engine.reset(seed=0)
@@ -325,7 +322,7 @@ I_xx = I_yy = m(2R² + 5r²) / 4
 
 - [x] Phase 1: Physics core (quaternion, inertia, Euler equations, RK4, spin motor) — 24 tests
 - [x] Phase 2: Disturbances and tanks (mass schedules, hybrid manifold, scenarios) — 22 tests
-- [x] Phase 3: Sensors and environment (accelerometers, mass tracker, Gymnasium) — 27 tests
+- [x] Phase 3: Sensors and environment (strain gauge array, Gymnasium) — 27 tests
 - [x] Phase 4: RL training (SAC agent, curriculum, training loop, CLI) — 12 tests
 - [x] Phase 5: Database and analysis (SQLite, experiment recording, plotting CLI) — 12 tests
 - [x] Phase 6: Stochastic disturbances + toroid geometry — 18 tests

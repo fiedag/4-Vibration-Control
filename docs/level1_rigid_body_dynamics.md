@@ -517,45 +517,47 @@ The reserve term softly biases the agent toward keeping water distributed evenly
 
 ## 10. Sensor Model (Observations)
 
-### 10.1 Accelerometers
+### 10.1 Strain Gauge Floor Force Sensors
 
-Each 3-axis accelerometer at body-frame position **r_s** measures:
-
-```
-a_meas = ω × (ω × r_s) + dω/dt × r_s + noise
-```
-
-The first term is centripetal (dominant, contains the spin-rate information). The second term contains the nutation/precession dynamics. In Level 1, there are no vibration components.
-
-**Sensor noise model:** White Gaussian noise with standard deviation σ_acc per axis.
-
-### 10.2 Sector Mass Estimates
-
-The mass tracking system provides:
-```
-m̂_ij(t) = m_ij(t) + noise
-```
-
-With update rate f_mass (typically much lower than accelerometer rate, e.g. 1 Hz vs 100 Hz).
-
-### 10.3 Observation Vector
-
-The full observation for the RL agent (with N_s accelerometers):
+Each sector floor (the outer rim wall) has a strain gauge measuring the compressive normal force from the mass above it. In the rotating body frame, the inertial acceleration at sector centroid **r_i** is:
 
 ```
-o = [ a_meas_1, ..., a_meas_Ns,            (3 × N_s accelerometer readings)
-      m̂_11, ..., m̂_12,3,                  (36 sector mass estimates)
-      m_tank_11, ..., m_tank_12,3,          (36 current tank fill levels)
-      m_manifold_1, m_manifold_2, m_manifold_3 ]  (3 manifold levels)
+a_i = ω × (ω × r_i) + dω/dt × r_i
 ```
 
-Total observation dimension: 3·N_s + 36 + 36 + 3 = 3·N_s + 75.
+The centripetal term `ω × (ω × r_i)` points inward and is dominant during steady spin (artificial gravity). The Euler term `dω/dt × r_i` captures angular acceleration from nutation and wobble.
 
-For example, with 6 accelerometers: dim(o) = 18 + 75 = **93**.
+The outward radial unit vector for sector i (projected onto the xy-plane):
+
+```
+r̂_i = (r_i projected onto xy) / |r_i projected onto xy|
+```
+
+The gauge measures the component of inertial force normal to the floor:
+
+```
+F_i = m_i · (-r̂_i · a_i) + noise
+```
+
+The sign convention gives **F_i > 0** for compressive load (mass pressing outward against the floor). During steady spin at rate ω_z: F_i ≈ m_i · ω_z² · R. Wobble (non-zero ω_x, ω_y) creates a sinusoidal variation in F_i around the ring that reveals the current nutation state.
+
+**Sensor noise model:** White Gaussian noise with standard deviation σ_gauge per gauge (Newtons). Default: 10 N.
+
+### 10.2 Observation Vector
+
+The full observation for the RL agent:
+
+```
+o = [ F_1, ..., F_36,                               (36 strain gauge readings, N)
+      m_tank_11, ..., m_tank_12,3,                   (36 current tank fill levels, kg)
+      m_manifold_1, m_manifold_2, m_manifold_3 ]     (3 manifold levels, kg)
+```
+
+Total observation dimension: 36 + 36 + 3 = **75**.
 
 The observation naturally decomposes into:
-- **Disturbance information**: sector masses + accelerometer readings (what's wrong)
-- **Actuator state**: tank fill levels + manifold levels (what resources are available)
+- **Disturbance information**: strain gauge forces (encode both sector occupancy and nutation state)
+- **Actuator state**: tank fill levels + manifold levels (available correction resources)
 
 ---
 
