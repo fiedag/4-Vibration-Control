@@ -158,6 +158,7 @@ def evaluate_agent(
     episode_records = []
 
     for ep in range(n_episodes):
+        print(f"Evaluating model: {model_path}, Episode {ep+1}/{n_episodes}")
         obs, _ = env.reset(seed=config.seed + ep)
         total_reward = 0.0
         done = False

@@ -75,12 +75,3 @@ class ToroidGeometry(HabitatGeometry):
         """Single manifold at origin (toroid has one axial station)."""
         return np.zeros((1, 3))
 
-    def compute_default_accelerometer_positions(
-        self, n_accels: int = 6
-    ) -> np.ndarray:
-        """Two opposed sensors in equatorial plane at (R,0,0) and (-R,0,0).
-
-        Returns (2, 3) regardless of n_accels.
-        """
-        R = self.config.radius
-        return np.array([[R, 0.0, 0.0], [-R, 0.0, 0.0]])

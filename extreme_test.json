@@ -39,7 +39,13 @@
         "control_dt": 0.1,
         "dynamics_level": 1
     },
-    "disturbances": [],
+    "disturbances": [
+        {
+            "type": "mass_schedule",
+            "static_masses": [{"sector": 0, "mass": 200.0}],
+            "transfers": []
+        }
+    ],
     "rl": {
         "algorithm": "SAC",
         "total_timesteps": 500000,
@@ -51,10 +57,7 @@
         "gamma": 0.99,
         "tau": 0.005,
         "ent_coef": "auto",
-        "net_arch": [
-            256,
-            256
-        ],
+        "net_arch": [256, 256],
         "eval_freq": 5000,
         "n_eval_episodes": 5,
         "checkpoint_freq": 25000,
@@ -62,12 +65,12 @@
         "curriculum": true
     },
     "stochastic": {
-        "poisson_crew": false,
+        "poisson_crew": true,
         "n_crew": 6,
         "mass_per_person": 80.0,
         "lambda_rate": 0.01,
         "transfer_duration": 30.0,
-        "micro_impacts": false,
+        "micro_impacts": true,
         "impact_rate": 0.001,
         "impact_mass_std": 0.1,
         "impact_duration": 1.0

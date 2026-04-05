@@ -21,6 +21,7 @@ from __future__ import annotations
 from typing import Any, Optional
 
 import numpy as np
+from numpy.char import mod
 
 try:
     import gymnasium
@@ -132,11 +133,17 @@ class HabitatEnv(gymnasium.Env):
         self._step_count += 1
 
         terminated = self._step_count >= self._max_steps
+
+
+
         truncated = False
 
         # Add useful metrics to info
         info["step_count"] = self._step_count
         info["nutation_angle_deg"] = self.engine.get_nutation_angle()
+
+        if self._step_count % 1000 == 0:
+            print(f"Step {self._step_count}/{self._max_steps}, Reward: {reward:.4f}, Info: {info}")
 
         return obs, reward, terminated, truncated, info
 

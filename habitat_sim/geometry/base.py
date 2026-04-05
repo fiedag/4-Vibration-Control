@@ -97,22 +97,3 @@ class HabitatGeometry(ABC):
             positions[j, 2] = -L / 2.0 + (j + 0.5) * d_z
         return positions
 
-    def compute_default_accelerometer_positions(
-        self, n_accels: int = 6
-    ) -> np.ndarray:
-        """Place accelerometers: 2 per axial station, opposed at 0° and 180°.
-
-        Returns (n_accels, 3).  Assumes n_accels is even and
-        n_accels // 2 <= n_stations (typically 6 accels, 3 stations).
-        """
-        R = self.config.radius
-        L = self.config.length
-        n_stations = n_accels // 2
-        d_z = L / n_stations
-
-        positions = np.zeros((n_accels, 3))
-        for j in range(n_stations):
-            z_j = -L / 2.0 + (j + 0.5) * d_z
-            positions[2 * j]     = [ R, 0.0, z_j]   # 0°
-            positions[2 * j + 1] = [-R, 0.0, z_j]   # 180°
-        return positions

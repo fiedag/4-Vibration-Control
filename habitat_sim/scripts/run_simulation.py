@@ -16,7 +16,7 @@ def main() -> None:
                         help="Path to trained SAC model .zip for evaluation.")
     parser.add_argument("--config", type=str, default=None,
                         help="Path to JSON ExperimentConfig file.")
-    parser.add_argument("--episodes", type=int, default=5,
+    parser.add_argument("--episodes", type=int, default=1,
                         help="Number of evaluation episodes (with --model).")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()

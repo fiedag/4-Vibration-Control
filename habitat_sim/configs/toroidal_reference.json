@@ -31,11 +31,7 @@
         "target_spin_rate": 0.2094
     },
     "sensors": {
-        "n_accelerometers": 6,
-        "accelerometer_noise_std": 0.001,
-        "mass_tracker_noise_std": 1.0,
-        "mass_tracker_update_rate": 1.0,
-        "accelerometer_positions": null
+        "strain_gauge_noise_std": 10.0
     },
     "simulation": {
         "dt": 0.01,
